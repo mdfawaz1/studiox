@@ -20,16 +20,42 @@ if [ ! -f "${DEPLOY_DIR}/.env" ]; then
   exit 1
 fi
 
+# Load variables from .env to read POSTGRES_HOST
+if [ -f "${DEPLOY_DIR}/.env" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    # Strip carriage returns (CRLF) to prevent export errors
+    line="${line//$'\r'/}"
+    # Strip inline comments (everything from '#' onwards)
+    line="${line%%#*}"
+    # Trim trailing whitespace
+    line="${line%"${line##*[![:space:]]}"}"
+    # Trim leading whitespace
+    line="${line#${line%%[![:space:]]*}}"
+    if [[ ! -z "$line" ]]; then
+      export "$line"
+    fi
+  done < "${DEPLOY_DIR}/.env"
+fi
+
 echo "==> git pull"
 git pull --ff-only
 
 cd "${DEPLOY_DIR}"
 
 echo "==> Building images"
-docker compose build
+docker compose build --no-cache
 
-echo "==> Bringing up Postgres"
-docker compose up -d postgres
+echo "==> Checking Postgres Host"
+if [ "${POSTGRES_HOST:-localhost}" = "localhost" ] || [ "${POSTGRES_HOST:-postgres}" = "postgres" ]; then
+  echo "==> Bringing up local Postgres container"
+  docker compose up -d postgres
+  echo "==> Waiting for Postgres to be ready..."
+  until docker exec projectx-postgres-1 pg_isready -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null 2>&1; do
+    sleep 1
+  done
+else
+  echo "==> Using remote Postgres host: ${POSTGRES_HOST}"
+fi
 
 echo "==> Applying migrations"
 docker compose --profile tools run --rm migrate

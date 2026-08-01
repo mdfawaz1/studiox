@@ -12,16 +12,20 @@ import (
 type ChannelKind string
 
 const (
-	KindWhatsAppMeta  ChannelKind = "whatsapp_meta"
-	KindInstagramMeta ChannelKind = "instagram_meta"
-	KindMessengerMeta ChannelKind = "messenger_meta"
-	KindXDM           ChannelKind = "x_dm"
-	KindSMS           ChannelKind = "sms"
+	KindWhatsAppMeta    ChannelKind = "whatsapp_meta"
+	KindWhatsAppWeb     ChannelKind = "whatsapp_web" // QR-linked via Baileys (no Meta API needed)
+	KindInstagramMeta   ChannelKind = "instagram_meta"
+	KindMessengerMeta   ChannelKind = "messenger_meta"
+	KindXDM             ChannelKind = "x_dm"
+	KindSMS             ChannelKind = "sms"
+	KindGoogleAds       ChannelKind = "google_ads"
+	KindTelegram        ChannelKind = "telegram"
+	KindTelegramMTProto ChannelKind = "telegram_mtproto" // QR-linked via tg-web/teleproto (no bot needed)
 )
 
 func (k ChannelKind) Valid() bool {
 	switch k {
-	case KindWhatsAppMeta, KindInstagramMeta, KindMessengerMeta, KindXDM, KindSMS:
+	case KindWhatsAppMeta, KindWhatsAppWeb, KindInstagramMeta, KindMessengerMeta, KindXDM, KindSMS, KindGoogleAds, KindTelegram, KindTelegramMTProto:
 		return true
 	}
 	return false
@@ -32,11 +36,12 @@ func (k ChannelKind) Valid() bool {
 type IdentityKind string
 
 const (
-	IdentityPhone  IdentityKind = "phone"
-	IdentityEmail  IdentityKind = "email"
-	IdentityIGPSID IdentityKind = "ig_psid"
-	IdentityFBPSID IdentityKind = "fb_psid"
-	IdentityXID    IdentityKind = "x_id"
+	IdentityPhone          IdentityKind = "phone"
+	IdentityEmail          IdentityKind = "email"
+	IdentityIGPSID         IdentityKind = "ig_psid"
+	IdentityFBPSID         IdentityKind = "fb_psid"
+	IdentityXID            IdentityKind = "x_id"
+	IdentityTelegramChatID IdentityKind = "telegram_chat_id"
 )
 
 type ContactIdentity struct {
@@ -80,6 +85,13 @@ type ChannelAccount struct {
 	AccessToken string `json:"-"`
 }
 
+// TGWebSession is one studio's decrypted tg-web (QR-linked Telegram) session
+// string, used to rehydrate the tg-web Node service after a restart.
+type TGWebSession struct {
+	StudioID      uuid.UUID
+	SessionString string
+}
+
 // ----- conversation -----
 
 type ConvStatus string
@@ -114,8 +126,14 @@ type Conversation struct {
 	LastMessageAt        time.Time   `json:"lastMessageAt"`
 	LastMessagePreview   string      `json:"lastMessagePreview"`
 	LastMessageDirection *Direction  `json:"lastMessageDirection,omitempty"`
-	CreatedAt            time.Time   `json:"createdAt"`
-	UpdatedAt            time.Time   `json:"updatedAt"`
+	LeadStatus           *string     `json:"leadStatus,omitempty"`
+	AIEnabled            bool        `json:"aiEnabled"`
+	// DNDEnabled silences automation for this conversation even when there's
+	// no linked lead to carry the (older, lead-scoped) leads.dnd_enabled
+	// flag — see ai_worker.go, which checks both.
+	DNDEnabled bool      `json:"dndEnabled"`
+	CreatedAt  time.Time `json:"createdAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
 }
 
 // ----- message -----

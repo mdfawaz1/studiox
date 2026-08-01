@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -170,7 +171,7 @@ func (m *MetaWhatsApp) SendText(ctx context.Context, accessToken, channelExterna
 		}
 	}
 
-	if len(parsedButtons) >= 2 && len(parsedButtons) <= 3 {
+	if len(parsedButtons) >= 1 && len(parsedButtons) <= 3 {
 		useButtons = true
 		btnBody = strings.TrimSpace(strings.Join(cleanBodyLines, "\n"))
 		if btnBody == "" {
@@ -209,7 +210,7 @@ func (m *MetaWhatsApp) SendText(ctx context.Context, accessToken, channelExterna
 			mediaID, uploadErr := m.uploadMediaToMeta(ctx, accessToken, channelExternalID, localPath)
 			if uploadErr != nil {
 				// Non-fatal: fall back to link (only works if server is public)
-				fmt.Printf("[WARN] Meta media upload failed (%v); falling back to link\n", uploadErr)
+				slog.Warn("meta whatsapp media upload failed, falling back to link", "err", uploadErr)
 				mediaObj["link"] = attURL
 			} else {
 				mediaObj["id"] = mediaID
@@ -294,10 +295,13 @@ func (m *MetaWhatsApp) SendText(ctx context.Context, accessToken, channelExterna
 			} `json:"error"`
 		}
 		_ = json.Unmarshal(respBody, &errEnv)
-		// In local dev mode, mock credential errors so testing doesn't require valid Meta credentials.
+		if resp.StatusCode == http.StatusUnauthorized || errEnv.Error.Code == 190 {
+			return nil, fmt.Errorf("%w: meta whatsapp auth failed: HTTP %d %s (code=%d, type=%s)",
+				ErrInvalidCredentials, resp.StatusCode, errEnv.Error.Message, errEnv.Error.Code, errEnv.Error.Type)
+		}
 		isLocalDev := os.Getenv("API_ENV") == "local"
-		if isLocalDev && (resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized || errEnv.Error.Code == 190 || errEnv.Error.Code == 131005 || errEnv.Error.Code == 131030 || errEnv.Error.Code == 100) {
-			fmt.Printf("[Meta API Error Mapped to Mock] HTTP Status %d, Error Body: %s\n", resp.StatusCode, string(respBody))
+		if isLocalDev && (resp.StatusCode == http.StatusForbidden || errEnv.Error.Code == 131005 || errEnv.Error.Code == 131030 || errEnv.Error.Code == 100) {
+			slog.Warn("meta whatsapp API error (local mock)", "status", resp.StatusCode, "body", string(respBody))
 			return &SendResult{
 				ExternalID: "wamid-mock-" + time.Now().Format("20060102150405"),
 			}, nil

@@ -20,11 +20,15 @@ import { formatDate } from '@/lib/datetime';
 import type { ChannelAccount, ChannelKind, ChannelStatus } from '@/lib/types';
 
 const KIND_LABELS: Record<ChannelKind, string> = {
+  whatsapp_web: 'WhatsApp (QR)',
   whatsapp_meta: 'WhatsApp',
   instagram_meta: 'Instagram DMs',
   messenger_meta: 'Facebook Messenger',
   x_dm: 'X DMs',
   sms: 'SMS',
+  google_ads: 'Google Ads',
+  telegram: 'Telegram (Bot)',
+  telegram_mtproto: 'Telegram (QR)',
 };
 
 const STATUS_TONE: Record<ChannelStatus, 'success' | 'warning' | 'danger' | 'neutral'> = {
@@ -34,7 +38,7 @@ const STATUS_TONE: Record<ChannelStatus, 'success' | 'warning' | 'danger' | 'neu
   error: 'danger',
 };
 
-export function ChannelList({ studioId, channels }: { studioId: string; channels: ChannelAccount[] }) {
+export function ChannelList({ studioId, channels, showToast }: { studioId: string; channels: ChannelAccount[]; showToast: (msg: string) => void }) {
   const router = useRouter();
   const [pendingId, setPendingId] = useState<string | null>(null);
 
@@ -44,10 +48,15 @@ export function ChannelList({ studioId, channels }: { studioId: string; channels
   const [parentId, setParentId] = useState('');
   const [displayHandle, setDisplayHandle] = useState('');
   const [accessToken, setAccessToken] = useState('');
+  const [xConsumerSecret, setXConsumerSecret] = useState('');
+  const [xAccessToken, setXAccessToken] = useState('');
+  const [xAccessTokenSecret, setXAccessTokenSecret] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   async function disconnect(id: string) {
+    const c = channels.find((x) => x.id === id);
+    const channelName = c ? KIND_LABELS[c.kind] : 'Channel';
     const confirmed = confirm(
       '⚠️ Disconnect this channel?\n\n' +
       'After disconnecting:\n' +
@@ -60,7 +69,10 @@ export function ChannelList({ studioId, channels }: { studioId: string; channels
     setPendingId(id);
     try {
       await api(`/api/v1/studios/${studioId}/messaging/channels/${id}`, { method: 'DELETE' });
+      showToast(`${channelName} channel disconnected successfully.`);
       router.refresh();
+    } catch (err) {
+      showToast(err instanceof ApiError ? err.message : `Could not disconnect ${channelName}.`);
     } finally {
       setPendingId(null);
     }
@@ -72,16 +84,43 @@ export function ChannelList({ studioId, channels }: { studioId: string; channels
     setError(null);
     setSubmitting(true);
     try {
+      let finalAccessToken = accessToken || undefined;
+      let finalExternalId = externalId;
+      let finalDisplayHandle = displayHandle;
+      let finalParentId = parentId;
+
+      if (editingChannel.kind === 'sms') {
+        finalDisplayHandle = externalId;
+        if (accessToken) {
+          finalAccessToken = `${parentId}:${accessToken}`;
+        }
+      } else if (editingChannel.kind === 'x_dm') {
+        finalDisplayHandle = externalId;
+        if (parentId && xConsumerSecret && xAccessToken && xAccessTokenSecret) {
+          finalAccessToken = JSON.stringify({
+            consumer_key: parentId,
+            consumer_secret: xConsumerSecret,
+            access_token: xAccessToken,
+            access_token_secret: xAccessTokenSecret,
+          });
+        }
+      } else if (editingChannel.kind === 'google_ads') {
+        finalExternalId = externalId.trim().replace(/[\s-]/g, '');
+        finalParentId = parentId.trim().replace(/[\s-]/g, '');
+      }
+
       await api(`/api/v1/studios/${studioId}/messaging/channels/${editingChannel.id}`, {
         method: 'PUT',
         json: {
-          externalId,
-          parentId: editingChannel.kind === 'whatsapp_meta' ? parentId : undefined,
-          displayHandle,
-          accessToken: accessToken || undefined,
+          externalId: finalExternalId,
+          parentId: (editingChannel.kind === 'whatsapp_meta' || editingChannel.kind === 'sms' || editingChannel.kind === 'x_dm') ? finalParentId : undefined,
+          displayHandle: finalDisplayHandle,
+          accessToken: finalAccessToken,
         },
       });
+      const channelName = KIND_LABELS[editingChannel.kind];
       setEditingChannel(null);
+      showToast(`${channelName} channel configuration updated successfully.`);
       router.refresh();
     } catch (err) {
       if (err instanceof ApiError) setError(err.message);
@@ -138,6 +177,9 @@ export function ChannelList({ studioId, channels }: { studioId: string; channels
                     setParentId(c.parentId || '');
                     setDisplayHandle(c.displayHandle);
                     setAccessToken('');
+                    setXConsumerSecret('');
+                    setXAccessToken('');
+                    setXAccessTokenSecret('');
                     setError(null);
                   }}
                   leftIcon={<Pencil className="h-4 w-4" />}
@@ -279,18 +321,145 @@ export function ChannelList({ studioId, channels }: { studioId: string; channels
                 </>
               )}
 
-              <div>
-                <Label htmlFor="edit-accessToken">Access token (leave blank to keep current)</Label>
-                <Input
-                  id="edit-accessToken"
-                  type="password"
-                  placeholder="••••••••••••••••"
-                  value={accessToken}
-                  onChange={(e) => setAccessToken(e.target.value)}
-                  className="font-mono text-xs"
-                />
-                <FieldHint>Only enter a value if you wish to update or renew the access token.</FieldHint>
-              </div>
+              {editingChannel.kind === 'sms' && (
+                <>
+                  <div>
+                    <Label htmlFor="edit-twilioSid">Twilio Account SID</Label>
+                    <Input
+                      id="edit-twilioSid"
+                      placeholder="ACxxxxxxxxxxxxxxxxxxxxxxxx"
+                      required
+                      value={parentId}
+                      onChange={(e) => setParentId(e.target.value)}
+                      className="font-mono text-xs"
+                    />
+                    <FieldHint>Find this in your Twilio Console Dashboard</FieldHint>
+                  </div>
+                  <div>
+                    <Label htmlFor="edit-twilioPhone">Twilio Phone Number</Label>
+                    <Input
+                      id="edit-twilioPhone"
+                      placeholder="+15556455341"
+                      required
+                      value={externalId}
+                      onChange={(e) => setExternalId(e.target.value)}
+                      className="font-mono text-xs"
+                    />
+                    <FieldHint>The active phone number purchased in Twilio.</FieldHint>
+                  </div>
+                </>
+              )}
+
+              {editingChannel.kind === 'x_dm' && (
+                <>
+                  <div>
+                    <Label htmlFor="edit-xHandle">X Handle (without @)</Label>
+                    <Input
+                      id="edit-xHandle"
+                      placeholder="e.g. PuneethGMt2"
+                      required
+                      value={externalId}
+                      onChange={(e) => setExternalId(e.target.value)}
+                      className="font-mono text-xs"
+                    />
+                    <FieldHint>The handle associated with these API keys.</FieldHint>
+                  </div>
+                  <div>
+                    <Label htmlFor="edit-consumerKey">Consumer Key (API Key)</Label>
+                    <Input
+                      id="edit-consumerKey"
+                      placeholder="e.g. mfnwJ9..."
+                      required
+                      value={parentId}
+                      onChange={(e) => setParentId(e.target.value)}
+                      className="font-mono text-xs"
+                    />
+                  </div>
+                  <div>
+                    <Label htmlFor="edit-consumerSecret">Consumer Secret (API Secret) (leave blank to keep current)</Label>
+                    <Input
+                      id="edit-consumerSecret"
+                      type="password"
+                      placeholder="••••••••••••••••"
+                      value={xConsumerSecret}
+                      onChange={(e) => setXConsumerSecret(e.target.value)}
+                      className="font-mono text-xs"
+                    />
+                  </div>
+                  <div>
+                    <Label htmlFor="edit-xAccessToken">Access Token (leave blank to keep current)</Label>
+                    <Input
+                      id="edit-xAccessToken"
+                      type="password"
+                      placeholder="••••••••••••••••"
+                      value={xAccessToken}
+                      onChange={(e) => setXAccessToken(e.target.value)}
+                      className="font-mono text-xs"
+                    />
+                  </div>
+                  <div>
+                    <Label htmlFor="edit-xAccessTokenSecret">Access Token Secret (leave blank to keep current)</Label>
+                    <Input
+                      id="edit-xAccessTokenSecret"
+                      type="password"
+                      placeholder="••••••••••••••••"
+                      value={xAccessTokenSecret}
+                      onChange={(e) => setXAccessTokenSecret(e.target.value)}
+                      className="font-mono text-xs"
+                    />
+                  </div>
+                </>
+              )}
+
+              {editingChannel.kind === 'google_ads' && (
+                <>
+                  <div>
+                    <Label htmlFor="edit-googleCustomerId">Google Ads Customer ID</Label>
+                    <Input
+                      id="edit-googleCustomerId"
+                      placeholder="e.g. 123-456-7890"
+                      required
+                      value={externalId}
+                      onChange={(e) => setExternalId(e.target.value)}
+                      className="font-mono text-xs"
+                    />
+                    <FieldHint>The account ID that should receive campaigns. Hyphens are optional.</FieldHint>
+                  </div>
+                  <div>
+                    <Label htmlFor="edit-googleLoginCustomerId">Google Ads Login Customer ID</Label>
+                    <Input
+                      id="edit-googleLoginCustomerId"
+                      placeholder="e.g. 987-654-3210 (manager account, optional)"
+                      value={parentId}
+                      onChange={(e) => setParentId(e.target.value)}
+                      className="font-mono text-xs"
+                    />
+                    <FieldHint>Only needed when the connected customer is accessed through a manager account.</FieldHint>
+                  </div>
+                </>
+              )}
+
+              {editingChannel.kind !== 'x_dm' && (
+                <div>
+                  <Label htmlFor="edit-accessToken">
+                    {editingChannel.kind === 'sms' 
+                      ? 'Twilio Auth Token (leave blank to keep current)' 
+                      : editingChannel.kind === 'google_ads'
+                      ? 'Google Ads Refresh Token (leave blank to keep current)'
+                      : 'Access token (leave blank to keep current)'
+                    }
+                  </Label>
+                  <Input
+                    id="edit-accessToken"
+                    type="password"
+                    placeholder="••••••••••••••••"
+                    value={accessToken}
+                    onChange={(e) => setAccessToken(e.target.value)}
+                    className="font-mono text-xs"
+                  />
+                  <FieldHint>Only enter a value if you wish to update or renew the credential token.</FieldHint>
+                </div>
+              )}
 
               <FieldError message={error ?? undefined} />
 

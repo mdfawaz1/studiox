@@ -22,9 +22,17 @@ export async function updateLeadStatus(
     notes: string;
     firstName?: string;
     lastName?: string;
+    fitnessPlan?: string;
     contactMade?: boolean;
     hotLead?: boolean;
     trialPurchased?: boolean;
+    assignedTo?: string;
+    trialAttended?: boolean;
+    memberSold?: boolean;
+    monthlyFee?: number;
+    currency?: string;
+    offer?: string;
+    furtherNotes?: string;
   },
 ): Promise<UpdateLeadResult> {
   const cookieStore = await cookies();

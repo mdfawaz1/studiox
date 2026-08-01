@@ -4,35 +4,95 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/mail"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/projectx/api/internal/identity"
+	"github.com/projectx/api/internal/integrations/glofox"
 )
 
 type Service struct {
 	repo     *Repo
 	identity *identity.Repo
+	glofox   *glofox.Client
 }
 
-func NewService(repo *Repo, id *identity.Repo) *Service {
-	return &Service{repo: repo, identity: id}
+func NewService(repo *Repo, id *identity.Repo, gf *glofox.Client) *Service {
+	return &Service{repo: repo, identity: id, glofox: gf}
+}
+
+// SyncLeadToGlofoxByID pushes a lead to Glofox CRM as trial/member. Used by
+// the Stripe webhook handler, which confirms actual payment (checkout.session.
+// completed) and updates the lead via raw SQL rather than through leads.Repo,
+// so it needs its own path to Glofox rather than relying on leads.Repo's sync.
+func (s *Service) SyncLeadToGlofoxByID(ctx context.Context, leadID string, status glofox.GlofoxLeadStatus) {
+	if s.glofox == nil || leadID == "" {
+		return
+	}
+	var firstName, lastName, name, email, phone string
+	err := s.repo.Pool().QueryRow(ctx, `
+		SELECT COALESCE(first_name,''), COALESCE(last_name,''), COALESCE(name,''), COALESCE(email,''), COALESCE(phone,'')
+		FROM leads WHERE id = $1
+	`, leadID).Scan(&firstName, &lastName, &name, &email, &phone)
+	if err != nil {
+		slog.Warn("Glofox | Lead sync: failed to load lead for sync", "component", "glofox", "lead_id", leadID, "err", err.Error())
+		return
+	}
+	if firstName == "" && lastName == "" && name != "" {
+		parts := strings.SplitN(name, " ", 2)
+		firstName = parts[0]
+		if len(parts) > 1 {
+			lastName = parts[1]
+		}
+	}
+	if lastName == "" {
+		// Glofox rejects the request outright without a last name — many
+		// WhatsApp leads only ever give a first name.
+		lastName = "-"
+	}
+	if email == "" && phone != "" {
+		// Same class of rejection as last name — fall back to a synthetic
+		// email for the Glofox call only; never written back to our DB.
+		email = "wa-" + phone + "@example.com"
+	}
+	go func() {
+		gCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		out, err := s.glofox.CreateLead(gCtx, glofox.CreateLeadInput{
+			Email:      email,
+			FirstName:  firstName,
+			LastName:   lastName,
+			Phone:      phone,
+			LeadStatus: status,
+		})
+		if err != nil {
+			slog.Warn("Glofox | Lead sync failed — lead conversion not reflected in Glofox CRM",
+				"component", "glofox", "lead_id", leadID, "new_status", string(status), "error", err.Error())
+		} else {
+			slog.Info("Glofox | Lead synced to Glofox CRM",
+				"component", "glofox", "lead_id", leadID, "new_status", string(status), "glofox_id", out.Entity.ID)
+		}
+	}()
 }
 
 // ----- create studio + first admin (atomic) -----
 
 type CreateStudioInput struct {
-	Slug          string
-	Name          string
-	BrandColor    string
-	LogoURL       string
-	ContactEmail  string
-	AdminEmail    string
-	AdminPassword string
+	Slug                 string
+	Name                 string
+	BrandColor           string
+	LogoURL              string
+	ContactEmail         string
+	ContactPhone         string
+	AdminEmail           string
+	AdminPassword        string
+	SocialPlannerEnabled bool
 }
 
 type CreateStudioResult struct {
@@ -49,6 +109,7 @@ func (s *Service) CreateStudioWithAdmin(ctx context.Context, in CreateStudioInpu
 	in.BrandColor = normalizeHex(in.BrandColor)
 	in.LogoURL = strings.TrimSpace(in.LogoURL)
 	in.ContactEmail = strings.ToLower(strings.TrimSpace(in.ContactEmail))
+	in.ContactPhone = strings.TrimSpace(in.ContactPhone)
 	in.AdminEmail = strings.ToLower(strings.TrimSpace(in.AdminEmail))
 
 	errs := map[string]string{}
@@ -74,6 +135,9 @@ func (s *Service) CreateStudioWithAdmin(ctx context.Context, in CreateStudioInpu
 			errs["contactEmail"] = "invalid email"
 		}
 	}
+	if in.ContactPhone != "" && len(in.ContactPhone) > 50 {
+		errs["contactPhone"] = "must be under 50 characters"
+	}
 	if len(errs) > 0 {
 		return nil, errs, nil
 	}
@@ -86,12 +150,16 @@ func (s *Service) CreateStudioWithAdmin(ctx context.Context, in CreateStudioInpu
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	studio := &Studio{
-		Slug:         in.Slug,
-		Name:         in.Name,
-		BrandColor:   in.BrandColor,
-		LogoURL:      in.LogoURL,
-		ContactEmail: in.ContactEmail,
-		Active:       true,
+		Slug:                 in.Slug,
+		Name:                 in.Name,
+		BrandColor:           in.BrandColor,
+		LogoURL:              in.LogoURL,
+		ContactEmail:         in.ContactEmail,
+		ContactPhone:         in.ContactPhone,
+		Active:               true,
+		ManagedBy1Hero:       true,
+		SocialPlannerEnabled: in.SocialPlannerEnabled,
+		KnowledgeBaseFiles:   []KnowledgeBaseFile{},
 	}
 	if err := s.repo.Create(ctx, tx, studio); err != nil {
 		if errors.Is(err, ErrSlugTaken) {
@@ -120,9 +188,57 @@ func (s *Service) CreateStudioWithAdmin(ctx context.Context, in CreateStudioInpu
 		return nil, nil, fmt.Errorf("create studio admin: %w", err)
 	}
 
+	_, err = tx.Exec(ctx, `
+		INSERT INTO plans (studio_id, plan_name, price_sgd, billing_cycle, features) VALUES 
+		($1, 'Trial', 0, 'one_time', ARRAY['Free', 'Limited features', 'Valid for 7 days']),
+		($1, 'Basic', 2900, 'monthly', ARRAY['Feature A', 'Feature B', 'Feature C']),
+		($1, 'Pro', 9900, 'monthly', ARRAY['All Basic Features', 'Feature D', 'Feature E']),
+		($1, 'Pro Plus', 19900, 'monthly', ARRAY['All Pro Features', 'Feature F', 'Feature G'])
+	`, studio.ID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create default plans: %w", err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, nil, fmt.Errorf("commit: %w", err)
 	}
+
+	// Register the studio admin in Glofox asynchronously.
+	// Failure here must never block or roll back studio creation.
+	if s.glofox != nil {
+		firstName, lastName := splitName(in.Name)
+		studioName := studio.Name
+		adminEmail := in.AdminEmail
+		studioID := studio.ID
+		go func() {
+			gCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_, err := s.glofox.RegisterUser(gCtx, glofox.RegisterUserInput{
+				Email:     adminEmail,
+				FirstName: firstName,
+				LastName:  lastName,
+				Phone:     in.ContactPhone,
+				Password:  in.AdminPassword,
+			})
+			if err != nil {
+				slog.Warn("Glofox | Studio admin account creation failed — admin will not appear in Glofox CRM",
+					"component", "glofox",
+					"studio_id", studioID,
+					"studio_name", studioName,
+					"admin_email", adminEmail,
+					"error", err.Error(),
+				)
+			} else {
+				slog.Info("Glofox | Studio admin account created successfully",
+					"component", "glofox",
+					"studio_id", studioID,
+					"studio_name", studioName,
+					"admin_email", adminEmail,
+				)
+			}
+		}()
+	}
+
 	return &CreateStudioResult{Studio: studio, AdminID: adminID}, nil, nil
 }
 
@@ -145,16 +261,44 @@ type UpdateStudioInput struct {
 	BrandColor           string
 	LogoURL              string
 	ContactEmail         string
+	ContactPhone         string `json:"contactPhone"`
 	Active               bool
-	AvailabilitySlots    []AvailabilitySlot `json:"availabilitySlots"`
-	AvailabilityTimezone string `json:"availabilityTimezone"`
+	ManagedBy1Hero       bool
+	AvailabilitySlots    []AvailabilitySlot  `json:"availabilitySlots"`
+	AvailabilityTimezone string              `json:"availabilityTimezone"`
+	GeminiAPIKey         string              `json:"geminiApiKey"`
+	GroqAPIKey           string              `json:"groqApiKey"`
+	MetaAppID            string              `json:"metaAppId"`
+	MetaAppSecret        string              `json:"metaAppSecret"`
+	GoogleClientID       string              `json:"googleClientId"`
+	GoogleClientSecret   string              `json:"googleClientSecret"`
+	GoogleDeveloperToken string              `json:"googleDeveloperToken"`
+	SocialPlannerEnabled bool                `json:"socialPlannerEnabled"`
+	KnowledgeBase        string              `json:"knowledgeBase"`
+	KnowledgeBaseFiles   []KnowledgeBaseFile `json:"knowledgeBaseFiles"`
+	GreetingMessage      string              `json:"greetingMessage"`
+	TrialAmountSGD       int                 `json:"trialAmountSgd"`
+	BookingHeroImageURL  string              `json:"bookingHeroImageUrl"`
+	BookingHeroVideoURL  string              `json:"bookingHeroVideoUrl"`
 }
 
 func (s *Service) Update(ctx context.Context, id uuid.UUID, in UpdateStudioInput) (map[string]string, error) {
+	oldStudio, err := s.repo.GetByID(ctx, id)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+
 	in.Name = strings.TrimSpace(in.Name)
 	in.BrandColor = normalizeHex(in.BrandColor)
 	in.LogoURL = strings.TrimSpace(in.LogoURL)
 	in.ContactEmail = strings.ToLower(strings.TrimSpace(in.ContactEmail))
+	in.ContactPhone = strings.TrimSpace(in.ContactPhone)
+	in.GeminiAPIKey = strings.TrimSpace(in.GeminiAPIKey)
+	in.MetaAppID = strings.TrimSpace(in.MetaAppID)
+	in.MetaAppSecret = strings.TrimSpace(in.MetaAppSecret)
+	in.GoogleClientID = strings.TrimSpace(in.GoogleClientID)
+	in.GoogleClientSecret = strings.TrimSpace(in.GoogleClientSecret)
+	in.GoogleDeveloperToken = strings.TrimSpace(in.GoogleDeveloperToken)
 
 	errs := map[string]string{}
 	if in.Name == "" {
@@ -168,13 +312,108 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, in UpdateStudioInput
 			errs["contactEmail"] = "invalid email"
 		}
 	}
+	if in.ContactPhone != "" && len(in.ContactPhone) > 50 {
+		errs["contactPhone"] = "must be under 50 characters"
+	}
 	if len(errs) > 0 {
 		return errs, nil
 	}
-	if err := s.repo.Update(ctx, id, in.Name, in.BrandColor, in.LogoURL, in.ContactEmail, in.Active, in.AvailabilitySlots, in.AvailabilityTimezone); err != nil {
+	if err := s.repo.Update(ctx, id, in.Name, in.BrandColor, in.LogoURL, in.ContactEmail, in.ContactPhone, in.Active, in.ManagedBy1Hero, in.AvailabilitySlots, in.AvailabilityTimezone, in.GeminiAPIKey, in.GroqAPIKey, in.MetaAppID, in.MetaAppSecret, in.GoogleClientID, in.GoogleClientSecret, in.GoogleDeveloperToken, in.SocialPlannerEnabled, in.KnowledgeBase, in.KnowledgeBaseFiles, in.GreetingMessage, in.TrialAmountSGD, in.BookingHeroImageURL, in.BookingHeroVideoURL); err != nil {
 		return nil, err
 	}
+
+	// Trigger RAG embedding rebuild if knowledge base or API key changed
+	kbChanged := oldStudio == nil ||
+		oldStudio.KnowledgeBase != in.KnowledgeBase ||
+		oldStudio.GeminiAPIKey != in.GeminiAPIKey ||
+		len(oldStudio.KnowledgeBaseFiles) != len(in.KnowledgeBaseFiles)
+
+	if !kbChanged && oldStudio != nil {
+		for idx, file := range oldStudio.KnowledgeBaseFiles {
+			if file.Name != in.KnowledgeBaseFiles[idx].Name ||
+				file.URL != in.KnowledgeBaseFiles[idx].URL ||
+				file.Text != in.KnowledgeBaseFiles[idx].Text {
+				kbChanged = true
+				break
+			}
+		}
+	}
+
+	if kbChanged {
+		s.asyncSyncKnowledgeChunks(id, in.KnowledgeBase, in.KnowledgeBaseFiles, in.GeminiAPIKey)
+	}
+
 	return nil, nil
+}
+
+// asyncSyncKnowledgeChunks runs in a background goroutine so the HTTP
+// response is not blocked by embedding API calls.
+func (s *Service) asyncSyncKnowledgeChunks(studioID uuid.UUID, kbText string, kbFiles []KnowledgeBaseFile, geminiAPIKey string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+
+		apiKey := geminiAPIKey
+		if apiKey == "" {
+			if pk, err := s.repo.GetPlatformSetting(ctx, "gemini_api_key"); err == nil && pk != "" {
+				apiKey = pk
+			}
+		}
+		if apiKey == "" {
+			slog.Warn("knowledge sync skipped: no Gemini API key", "studio_id", studioID)
+			return
+		}
+
+		type rawChunk struct{ sourceType, sourceName, platform, content string }
+		var raw []rawChunk
+
+		// Main text always applies to every platform.
+		for _, content := range ChunkText(kbText, 800, 150) {
+			raw = append(raw, rawChunk{"text", "knowledge_base", "all", content})
+		}
+		for _, f := range kbFiles {
+			platform := f.Platform
+			if platform == "" {
+				platform = "all"
+			}
+			for _, content := range ChunkText(f.Text, 800, 150) {
+				raw = append(raw, rawChunk{"file", f.Name, platform, content})
+			}
+		}
+
+		if len(raw) == 0 {
+			if err := s.repo.SaveKnowledgeChunks(ctx, studioID, nil); err != nil {
+				slog.Error("knowledge chunks clear failed", "studio_id", studioID, "err", err)
+			}
+			return
+		}
+
+		var chunks []ChunkData
+		for i, rc := range raw {
+			vec, err := GetGeminiEmbedding(ctx, apiKey, rc.content)
+			if err != nil {
+				slog.Warn("embedding failed for chunk", "studio_id", studioID, "chunk", i, "err", err)
+				continue
+			}
+			chunks = append(chunks, ChunkData{
+				SourceType: rc.sourceType,
+				SourceName: rc.sourceName,
+				Platform:   rc.platform,
+				Index:      i,
+				Content:    rc.content,
+				Embedding:  vec,
+			})
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		if len(chunks) > 0 {
+			if err := s.repo.SaveKnowledgeChunks(ctx, studioID, chunks); err != nil {
+				slog.Error("knowledge chunks save failed", "studio_id", studioID, "err", err)
+			} else {
+				slog.Info("knowledge sync complete", "studio_id", studioID, "chunks", len(chunks))
+			}
+		}
+	}()
 }
 
 // ----- helpers -----
@@ -210,6 +449,17 @@ func generateSlug(name string) string {
 
 var nonAlnum = regexp.MustCompile(`[^a-z0-9]+`)
 
+// splitName splits a full name string into first and last components.
+// If there is only one word it is used as firstName with lastName empty.
+func splitName(name string) (first, last string) {
+	name = strings.TrimSpace(name)
+	idx := strings.LastIndex(name, " ")
+	if idx < 0 {
+		return name, ""
+	}
+	return strings.TrimSpace(name[:idx]), strings.TrimSpace(name[idx+1:])
+}
+
 func isPgUnique(err error) bool {
 	type pgErr interface{ SQLState() string }
 	var p pgErr
@@ -217,4 +467,32 @@ func isPgUnique(err error) bool {
 		return p.SQLState() == "23505"
 	}
 	return false
+}
+
+func (s *Service) UpdatePayments(ctx context.Context, id uuid.UUID, stripeAccountId, stripeSecretKey, stripePublishableKey, stripeWebhookSecret, subscriptionTier string) error {
+	return s.repo.UpdatePayments(ctx, id, stripeAccountId, stripeSecretKey, stripePublishableKey, stripeWebhookSecret, subscriptionTier)
+}
+
+func (s *Service) ListPlans(ctx context.Context, studioID uuid.UUID) ([]Plan, error) {
+	return s.repo.ListPlans(ctx, studioID)
+}
+
+func (s *Service) CreatePlan(ctx context.Context, studioID uuid.UUID, in CreatePlanInput) (Plan, error) {
+	return s.repo.CreatePlan(ctx, studioID, in)
+}
+
+func (s *Service) UpdatePlan(ctx context.Context, studioID, planID uuid.UUID, in UpdatePlanInput) error {
+	return s.repo.UpdatePlan(ctx, studioID, planID, in)
+}
+
+func (s *Service) DeletePlan(ctx context.Context, studioID, planID uuid.UUID) error {
+	return s.repo.DeletePlan(ctx, studioID, planID)
+}
+
+func (s *Service) GetPlatformSetting(ctx context.Context, key string) (string, error) {
+	return s.repo.GetPlatformSetting(ctx, key)
+}
+
+func (s *Service) UpdatePlatformSetting(ctx context.Context, key, value string) error {
+	return s.repo.UpdatePlatformSetting(ctx, key, value)
 }

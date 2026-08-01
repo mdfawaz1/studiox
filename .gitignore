@@ -1,14 +1,26 @@
-# Env / secrets
+# Env / secrets — NEVER commit these
 .env
 .env.local
 .env.*.local
+.env.production
+.env.staging
+.env.backup
+.env.bak
+deploy/.env.backup
+deploy/.env.*.backup
+deploy/.env.domain.backup
+deploy/.env.*
 /secrets/
 *.pem
 *.key
+*.p12
+*.pfx
+*credentials*.json
+*service-account*.json
 
 # Production deploy state — created on the EC2 box, never committed
 deploy/.env
-deploy/secrets/
+deploy/secrets/*
 deploy/backups/
 
 # Node
@@ -35,6 +47,18 @@ coverage.txt
 
 # Docker volumes (if mounted locally)
 .docker-data/
-*.json
+
+# WhatsApp Web session auth (mounted as Docker volume in prod)
+apps/wa-web/auth/
+apps/wa-web/.wwebjs_cache/
+# Runtime debug log — real phone numbers/message previews, never commit
+apps/wa-web/*.log
 heroic-artifact-434914-d4-1b7152cf7bec.json
+# Exclude all json except package manifests
+*.json
+!apps/wa-web/package.json
+!apps/wa-web/package-lock.json
+!apps/tg-web/package.json
+!apps/tg-web/package-lock.json
 apps/api/secrets/
+.aider*

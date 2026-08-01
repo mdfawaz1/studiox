@@ -1,11 +1,15 @@
 package messaging
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -40,15 +44,22 @@ func (h *Handler) AdminRoutes(r chi.Router) {
 	r.Post("/channels/whatsapp", h.connectWhatsApp)
 	r.Post("/channels/instagram", h.connectInstagram)
 	r.Post("/channels/messenger", h.connectMessenger)
+	r.Post("/channels/twilio", h.connectTwilio)
+	r.Post("/channels/x", h.connectX)
+	r.Post("/channels/telegram", h.connectTelegram)
 	r.Delete("/channels/{id}", h.disconnectChannel)
 	r.Put("/channels/{id}", h.updateChannel)
 
 	r.Get("/conversations", h.listConversations)
 	r.Post("/conversations", h.createConversation)
+	r.Post("/conversations/ai/bulk", h.setAllConversationsAI)
 	r.Get("/conversations/{id}", h.getConversation)
 	r.Get("/conversations/{id}/messages", h.listMessages)
 	r.Post("/conversations/{id}/messages", h.sendMessage)
 	r.Post("/conversations/{id}/read", h.markRead)
+	r.Post("/conversations/{id}/ai", h.setConversationAI)
+	r.Post("/conversations/{id}/dnd", h.setConversationDND)
+	r.Delete("/conversations/{id}", h.deleteConversation)
 
 	// Templates
 	r.Get("/templates", h.listTemplates)
@@ -76,6 +87,42 @@ func (h *Handler) AdminRoutes(r chi.Router) {
 	r.Post("/upload", h.uploadMedia)
 
 	r.Get("/stream", h.stream) // SSE — live updates for the inbox UI
+
+	// WhatsApp Web (QR-based) — proxies to the wa-web Node service
+	r.Get("/channels/whatsapp-web/qr", h.waWebQR)
+	r.Post("/channels/whatsapp-web/disconnect", h.waWebDisconnect)
+	r.Get("/channels/whatsapp-web/status", h.waWebStatus)
+	r.Post("/channels/whatsapp-web/backfill", h.waWebBackfillTrigger)
+	r.Get("/channels/whatsapp-web/backfill", h.waWebBackfillStatus)
+
+	// Telegram (QR-based personal account) — proxies to the tg-web Node service
+	r.Get("/channels/telegram-web/qr", h.tgWebQR)
+	r.Post("/channels/telegram-web/password", h.tgWebPassword)
+	r.Post("/channels/telegram-web/disconnect", h.tgWebDisconnect)
+	r.Get("/channels/telegram-web/status", h.tgWebStatus)
+	r.Post("/channels/telegram-web/backfill", h.tgWebBackfillTrigger)
+	r.Get("/channels/telegram-web/backfill", h.tgWebBackfillStatus)
+}
+
+// InternalRoutes are mounted at /internal (not exposed through nginx to public).
+// Called by the wa-web Node service to push session events into the Go pipeline.
+func (h *Handler) InternalRoutes(r chi.Router) {
+	r.Post("/wa-web/connected", h.waWebConnected)
+	r.Post("/wa-web/disconnected", h.waWebDisconnected)
+	r.Post("/wa-web/inbound", h.waWebInbound)
+	r.Get("/wa-web/studios", h.waWebStudios)
+	r.Post("/wa-web/backfill-running", h.waWebBackfillRunning)
+	r.Post("/wa-web/backfill", h.waWebBackfill)
+	r.Post("/wa-web/backfill-done", h.waWebBackfillDone)
+	r.Post("/wa-web/contact-name", h.waWebContactName)
+
+	r.Post("/tg-web/connected", h.tgWebConnected)
+	r.Post("/tg-web/inbound", h.tgWebInbound)
+	r.Post("/tg-web/media", h.tgWebMedia)
+	r.Get("/tg-web/sessions", h.tgWebSessions)
+	r.Post("/tg-web/backfill-running", h.tgWebBackfillRunning)
+	r.Post("/tg-web/backfill", h.tgWebBackfill)
+	r.Post("/tg-web/backfill-done", h.tgWebBackfillDone)
 }
 
 // ============================================================
@@ -168,6 +215,81 @@ func (h *Handler) connectMessenger(w http.ResponseWriter, r *http.Request) {
 		ParentID:      req.ParentID,
 		DisplayHandle: req.DisplayHandle,
 		AccessToken:   req.AccessToken,
+	})
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid", err.Error())
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, ch)
+}
+
+func (h *Handler) connectTwilio(w http.ResponseWriter, r *http.Request) {
+	studioID, ok := studioIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		AccountSID  string `json:"accountSid"`
+		AuthToken   string `json:"authToken"`
+		PhoneNumber string `json:"phoneNumber"`
+	}
+	if !httpx.DecodeJSON(w, r, &req) {
+		return
+	}
+	ch, err := h.svc.ConnectTwilioChannel(r.Context(), studioID, ConnectTwilioInput{
+		AccountSID:  req.AccountSID,
+		AuthToken:   req.AuthToken,
+		PhoneNumber: req.PhoneNumber,
+	})
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid", err.Error())
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, ch)
+}
+
+func (h *Handler) connectTelegram(w http.ResponseWriter, r *http.Request) {
+	studioID, ok := studioIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		BotToken string `json:"botToken"`
+	}
+	if !httpx.DecodeJSON(w, r, &req) {
+		return
+	}
+	ch, err := h.svc.ConnectTelegramChannel(r.Context(), studioID, ConnectTelegramInput{
+		BotToken: req.BotToken,
+	})
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid", err.Error())
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, ch)
+}
+
+func (h *Handler) connectX(w http.ResponseWriter, r *http.Request) {
+	studioID, ok := studioIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		ConsumerKey       string `json:"consumer_key"`
+		ConsumerSecret    string `json:"consumer_secret"`
+		AccessToken       string `json:"access_token"`
+		AccessTokenSecret string `json:"access_token_secret"`
+		XHandle           string `json:"x_handle"`
+	}
+	if !httpx.DecodeJSON(w, r, &req) {
+		return
+	}
+	ch, err := h.svc.ConnectXChannel(r.Context(), studioID, ConnectXInput{
+		ConsumerKey:       req.ConsumerKey,
+		ConsumerSecret:    req.ConsumerSecret,
+		AccessToken:       req.AccessToken,
+		AccessTokenSecret: req.AccessTokenSecret,
+		XHandle:           req.XHandle,
 	})
 	if err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid", err.Error())
@@ -362,6 +484,14 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 	if !httpx.DecodeJSON(w, r, &req) {
 		return
 	}
+	if len(req.Body) > 10000 {
+		httpx.WriteValidationError(w, map[string]string{"body": "message must be 10,000 characters or less"})
+		return
+	}
+	if len(req.Attachments) > 10 {
+		httpx.WriteValidationError(w, map[string]string{"attachments": "maximum 10 attachments per message"})
+		return
+	}
 	c := identity.MustClaims(r.Context())
 	jobID, err := h.svc.EnqueueReply(r.Context(), SendInput{
 		StudioID:       studioID,
@@ -388,6 +518,92 @@ func (h *Handler) markRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.MarkRead(r.Context(), studioID, id); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "internal", "internal server error")
+		return
+	}
+	httpx.NoContent(w)
+}
+
+// deleteConversation archives (closes) a conversation. The inbox UI presents
+// this as "delete" but message history is preserved rather than hard-deleted.
+func (h *Handler) setConversationAI(w http.ResponseWriter, r *http.Request) {
+	studioID, ok := studioIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "bad_id", "invalid id")
+		return
+	}
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if !httpx.DecodeJSON(w, r, &body) {
+		return
+	}
+	if err := h.svc.repo.SetConversationAIEnabled(r.Context(), studioID, id, body.Enabled); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "internal", "internal server error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]bool{"enabled": body.Enabled})
+}
+
+// setConversationDND toggles Do Not Disturb directly on a conversation — the
+// counterpart to the lead-scoped /leads/:id/dnd endpoint, for conversations
+// with no linked lead (e.g. imported WhatsApp Web contacts).
+func (h *Handler) setConversationDND(w http.ResponseWriter, r *http.Request) {
+	studioID, ok := studioIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "bad_id", "invalid id")
+		return
+	}
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if !httpx.DecodeJSON(w, r, &body) {
+		return
+	}
+	if err := h.svc.repo.SetConversationDNDEnabled(r.Context(), studioID, id, body.Enabled); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "internal", "internal server error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]bool{"enabled": body.Enabled})
+}
+
+func (h *Handler) setAllConversationsAI(w http.ResponseWriter, r *http.Request) {
+	studioID, ok := studioIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if !httpx.DecodeJSON(w, r, &body) {
+		return
+	}
+	if err := h.svc.repo.SetAllConversationsAIEnabled(r.Context(), studioID, body.Enabled); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "internal", "internal server error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]bool{"enabled": body.Enabled})
+}
+
+func (h *Handler) deleteConversation(w http.ResponseWriter, r *http.Request) {
+	studioID, ok := studioIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "bad_id", "invalid id")
+		return
+	}
+	if err := h.svc.CloseConversation(r.Context(), studioID, id); err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "internal", "internal server error")
 		return
 	}
@@ -457,14 +673,23 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
 // the routes mount under /studios/{studioId}/messaging.
 func studioIDFromPath(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
 	c := identity.MustClaims(r.Context())
+
+	// Super admins can access any studio via URL param
 	if c.IsSuper() {
-		id, err := uuid.Parse(chi.URLParam(r, "studioId"))
-		if err != nil {
-			httpx.WriteError(w, http.StatusBadRequest, "bad_studio_id", "invalid studio id")
+		studioIDStr := chi.URLParam(r, "studioId")
+		if studioIDStr == "" {
+			httpx.WriteError(w, http.StatusBadRequest, "bad_request", "studioId parameter required")
 			return uuid.Nil, false
 		}
-		return id, true
+		studioID, err := uuid.Parse(studioIDStr)
+		if err != nil {
+			httpx.WriteError(w, http.StatusBadRequest, "bad_request", "invalid studioId format")
+			return uuid.Nil, false
+		}
+		return studioID, true
 	}
+
+	// Studio admins use their bound studio
 	if c.StudioID == nil {
 		httpx.WriteError(w, http.StatusForbidden, "forbidden", "no studio bound to this user")
 		return uuid.Nil, false
@@ -672,6 +897,11 @@ func (h *Handler) redirectTriggerLink(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	_ = h.svc.RecordTriggerLinkClick(r.Context(), id, leadIDPtr)
+	parsed, err := url.Parse(tl.URL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_url", "trigger link has an invalid destination URL")
+		return
+	}
 	http.Redirect(w, r, tl.URL, http.StatusFound)
 }
 
@@ -822,25 +1052,152 @@ func (h *Handler) updateJob(w http.ResponseWriter, r *http.Request) {
 // AI assistant handlers
 // ============================================================
 
+func callGeminiAPI(ctx context.Context, apiKey string, prompt string) (string, error) {
+	// Try models in order; fall back when a model is unavailable or overloaded.
+	models := []string{"gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite"}
+
+	reqBody, err := json.Marshal(map[string]any{
+		"contents": []map[string]any{
+			{
+				"parts": []map[string]any{
+					{"text": prompt},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+
+	var lastErr error
+	for _, model := range models {
+		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", model, apiKey)
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(reqBody))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		respBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if resp.StatusCode >= 400 {
+			// 503 (overloaded) or 429 (rate limit) — try next model
+			if resp.StatusCode == 503 || resp.StatusCode == 429 {
+				lastErr = fmt.Errorf("gemini API error (HTTP %d): %s", resp.StatusCode, string(respBytes))
+				continue
+			}
+			// 404 = model not found — try next model
+			if resp.StatusCode == 404 {
+				lastErr = fmt.Errorf("model %s not found", model)
+				continue
+			}
+			return "", fmt.Errorf("gemini API error (HTTP %d): %s", resp.StatusCode, string(respBytes))
+		}
+
+		var res struct {
+			Candidates []struct {
+				Content struct {
+					Parts []struct {
+						Text string `json:"text"`
+					} `json:"parts"`
+				} `json:"content"`
+			} `json:"candidates"`
+		}
+
+		if err := json.Unmarshal(respBytes, &res); err != nil {
+			lastErr = err
+			continue
+		}
+
+		if len(res.Candidates) == 0 || len(res.Candidates[0].Content.Parts) == 0 {
+			lastErr = fmt.Errorf("empty response from Gemini API")
+			continue
+		}
+
+		return res.Candidates[0].Content.Parts[0].Text, nil
+	}
+
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("all Gemini models failed")
+}
+
 func (h *Handler) aiGenerateTemplate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Prompt string `json:"prompt"`
+		Type   string `json:"type"`
 	}
 	if !httpx.DecodeJSON(w, r, &req) {
 		return
 	}
-	prompt := strings.ToLower(req.Prompt)
-	body := "Hi {{contact.first_name}},\n\n"
-	if strings.Contains(prompt, "price") || strings.Contains(prompt, "rate") || strings.Contains(prompt, "cost") {
-		body += "Thanks for asking about our pricing plans! We have multiple packages tailored for you. Ready to get started?\n\nBest,\n{{studio.name}} Team"
-	} else if strings.Contains(prompt, "trial") || strings.Contains(prompt, "book") || strings.Contains(prompt, "schedule") {
-		body += "We'd love to invite you for a trial session at {{studio.name}}! When would be a good time for you to visit us?\n\nBest,\n{{studio.name}} Team"
-	} else if strings.Contains(prompt, "follow") || strings.Contains(prompt, "check") || strings.Contains(prompt, "remind") {
-		body += "Just checking in to see if you have any questions about {{campaign.name}}. We're here to help you on your fitness journey!\n\nBest,\n{{studio.name}} Team"
-	} else {
-		body += "Thanks for reaching out to us! We'd love to help you get started with your fitness goals. Let us know what you're interested in!\n\nBest,\n{{studio.name}} Team"
+
+	studioID, ok := studioIDFromPath(w, r)
+	if !ok {
+		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]string{"body": body})
+
+	var apiKey string
+	err := h.svc.repo.Pool().QueryRow(r.Context(), `
+		SELECT gemini_api_key FROM studios WHERE id = $1
+	`, studioID).Scan(&apiKey)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "internal", "failed to load studio config")
+		return
+	}
+
+	if apiKey == "" {
+		httpx.WriteError(w, http.StatusBadRequest, "missing_api_key", "Please configure your Gemini API Key in the Studio Settings to write templates with AI.")
+		return
+	}
+
+	var systemInstruction string
+	if req.Type == "social" {
+		systemInstruction = `You are a social media manager for a fitness studio.
+Important:
+1. Do not use generic greetings or sign-offs.
+2. Keep it energetic, modern, and perfectly formatted for a social media post (X/Twitter, Facebook).
+3. Use emojis where appropriate.
+4. Do not use template brackets or variables.
+
+Generate the social media copy based on this instruction: ` + req.Prompt
+	} else {
+		systemInstruction = `Generate a professional, friendly customer message template for a fitness studio.
+Important:
+1. The message must NOT contain any salutation or greeting (e.g. do not start with "Hi" or "Dear" or "Hello").
+2. The message must NOT contain any sign-off or signature (e.g. do not end with "Best" or "Regards" or "Studio Team").
+3. Make it brief, conversational, and direct.
+4. If the instruction references a plan, campaign, or link, write the copy naturally.
+
+Generate the message content based on this instruction: ` + req.Prompt
+	}
+
+	generatedText, err := callGeminiAPI(r.Context(), apiKey, systemInstruction)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "gemini_error", fmt.Sprintf("AI Generation failed: %v", err))
+		return
+	}
+
+	var body string
+	if req.Type == "social" {
+		body = strings.TrimSpace(generatedText)
+	} else {
+		body = fmt.Sprintf("Hi {{contact.first_name}},\n\n%s\n\nBest,\n{{studio.name}} Team", strings.TrimSpace(generatedText))
+	}
+
+	httpx.JSON(w, http.StatusOK, map[string]string{"body": body, "text": body})
 }
 
 // uploadMedia accepts a multipart/form-data upload (field "file"), saves it
@@ -874,7 +1231,8 @@ func (h *Handler) uploadMedia(w http.ResponseWriter, r *http.Request) {
 	allowed := map[string]bool{
 		".jpg": true, ".jpeg": true, ".png": true, ".gif": true,
 		".webp": true, ".mp4": true, ".mov": true, ".pdf": true,
-		".doc": true, ".docx": true,
+		".doc": true, ".docx": true, ".txt": true, ".csv": true,
+		".json": true, ".md": true,
 	}
 	if !allowed[strings.ToLower(ext)] {
 		httpx.WriteError(w, http.StatusBadRequest, "bad_request", "unsupported file type")

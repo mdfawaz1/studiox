@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,19 +13,28 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/projectx/api/internal/platform/cache"
 	"github.com/projectx/api/internal/platform/secrets"
 )
 
 type Repo struct {
-	pool   *pgxpool.Pool
-	cipher *secrets.Cipher
+	pool      *pgxpool.Pool
+	cipher    *secrets.Cipher
+	planCache *cache.MemoryCache
 }
 
 func NewRepo(pool *pgxpool.Pool, cipher *secrets.Cipher) *Repo {
-	return &Repo{pool: pool, cipher: cipher}
+	return &Repo{pool: pool, cipher: cipher, planCache: cache.New()}
 }
 
 func (r *Repo) Pool() *pgxpool.Pool { return r.pool }
+
+// SemanticMatch wraps a Message with the cosine similarity score returned by
+// SearchSemanticHistory.
+type SemanticMatch struct {
+	Message
+	Score float32
+}
 
 // ============================================================
 // channel_accounts
@@ -98,6 +108,20 @@ func (r *Repo) ListChannels(ctx context.Context, studioID uuid.UUID) ([]ChannelA
 
 // GetChannelByID returns a channel WITH the decrypted access token. Use for
 // outbound dispatching only.
+// GetChannelKind returns just a channel's kind, without decrypting its
+// access token — used where callers only need to branch on kind and
+// shouldn't fail if the token happens to be undecryptable.
+func (r *Repo) GetChannelKind(ctx context.Context, studioID, id uuid.UUID) (ChannelKind, error) {
+	var kind ChannelKind
+	err := r.pool.QueryRow(ctx, `
+		SELECT kind FROM channel_accounts WHERE studio_id = $1 AND id = $2
+	`, studioID, id).Scan(&kind)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return kind, err
+}
+
 func (r *Repo) GetChannelByID(ctx context.Context, studioID, id uuid.UUID) (*ChannelAccount, error) {
 	row := r.pool.QueryRow(ctx, `
 		SELECT id, studio_id, kind, bsp, external_id, parent_id, display_handle,
@@ -266,6 +290,206 @@ func (r *Repo) MarkChannelError(ctx context.Context, id uuid.UUID, msg string) e
 	return err
 }
 
+// UpsertWAWebChannel creates or re-activates the whatsapp_web channel for a studio.
+// Called when the Baileys session connects successfully after QR scan.
+// phone is the linked WhatsApp number (e.g. "6512345678").
+func (r *Repo) UpsertWAWebChannel(ctx context.Context, studioID uuid.UUID, phone string) error {
+	placeholder, _ := r.cipher.Encrypt("wa-web-baileys")
+
+	// Try to re-activate an existing row for this studio first.
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE channel_accounts
+		SET status = 'active', display_handle = $2, external_id = $2,
+		    connected_at = now(), disconnected_at = NULL, updated_at = now()
+		WHERE studio_id = $1 AND kind = 'whatsapp_web'
+	`, studioID, phone)
+	if err != nil {
+		return fmt.Errorf("upsert wa_web channel (update): %w", err)
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+
+	// No existing row — insert fresh.
+	_, err = r.pool.Exec(ctx, `
+		INSERT INTO channel_accounts
+		  (studio_id, kind, bsp, external_id, parent_id, display_handle,
+		   access_token_enc, status, connected_at, updated_at)
+		VALUES ($1, 'whatsapp_web', 'baileys', $2, '', $2, $3, 'active', now(), now())
+	`, studioID, phone, placeholder)
+	if err != nil {
+		return fmt.Errorf("upsert wa_web channel (insert): %w", err)
+	}
+	return nil
+}
+
+// ListWAWebStudioIDs returns all studio IDs that have a whatsapp_web channel (any status).
+func (r *Repo) ListWAWebStudioIDs(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT DISTINCT studio_id FROM channel_accounts
+		WHERE kind = 'whatsapp_web'
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// DisconnectWAWebChannel marks any active whatsapp_web channel for a studio as disconnected.
+func (r *Repo) DisconnectWAWebChannel(ctx context.Context, studioID uuid.UUID) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE channel_accounts
+		SET status = 'disconnected', disconnected_at = now(), updated_at = now()
+		WHERE studio_id = $1 AND kind = 'whatsapp_web' AND status <> 'disconnected'
+	`, studioID)
+	return err
+}
+
+// SetWAWebBackfillStatus records history-import progress for a studio's
+// whatsapp_web channel so the admin UI can poll it (running/done/failed).
+func (r *Repo) SetWAWebBackfillStatus(ctx context.Context, studioID uuid.UUID, status string, messageCount int) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE channel_accounts
+		SET backfill_status = $2, backfill_message_count = $3, backfill_updated_at = now()
+		WHERE studio_id = $1 AND kind = 'whatsapp_web'
+	`, studioID, status, messageCount)
+	return err
+}
+
+// GetWAWebBackfillStatus reports the current history-import status for a studio.
+func (r *Repo) GetWAWebBackfillStatus(ctx context.Context, studioID uuid.UUID) (status string, messageCount int, err error) {
+	err = r.pool.QueryRow(ctx, `
+		SELECT backfill_status, backfill_message_count
+		FROM channel_accounts
+		WHERE studio_id = $1 AND kind = 'whatsapp_web'
+		ORDER BY connected_at DESC
+		LIMIT 1
+	`, studioID).Scan(&status, &messageCount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "none", 0, nil
+	}
+	return status, messageCount, err
+}
+
+// ============================================================
+// telegram_mtproto (tg-web QR-linked personal account)
+// ============================================================
+
+// UpsertTGWebChannel persists (or reactivates) a studio's QR-linked Telegram
+// session. Unlike wa-web — whose real auth state lives on a Docker volume,
+// with the DB only holding a placeholder token — a GramJS session IS a
+// single string, so it's stored for real (encrypted) here and is the source
+// of truth tg-web rehydrates from on restart (see ListTGWebSessions).
+func (r *Repo) UpsertTGWebChannel(ctx context.Context, studioID uuid.UUID, phone, username, sessionString string) error {
+	enc, err := r.cipher.Encrypt(sessionString)
+	if err != nil {
+		return fmt.Errorf("encrypt tg-web session: %w", err)
+	}
+	displayHandle := phone
+	if username != "" {
+		displayHandle = "@" + username
+	}
+
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE channel_accounts
+		SET status = 'active', display_handle = $2, external_id = $3,
+		    access_token_enc = $4, connected_at = now(), disconnected_at = NULL, updated_at = now()
+		WHERE studio_id = $1 AND kind = 'telegram_mtproto'
+	`, studioID, displayHandle, phone, enc)
+	if err != nil {
+		return fmt.Errorf("upsert tg-web channel (update): %w", err)
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+
+	_, err = r.pool.Exec(ctx, `
+		INSERT INTO channel_accounts
+		  (studio_id, kind, bsp, external_id, parent_id, display_handle,
+		   access_token_enc, status, connected_at, updated_at)
+		VALUES ($1, 'telegram_mtproto', 'telegram_mtproto', $2, '', $3, $4, 'active', now(), now())
+	`, studioID, phone, displayHandle, enc)
+	if err != nil {
+		return fmt.Errorf("upsert tg-web channel (insert): %w", err)
+	}
+	return nil
+}
+
+// ListTGWebSessions returns every active telegram_mtproto channel's studio
+// ID + decrypted session string, so tg-web can resume all of them after a
+// restart without a fresh QR scan per studio.
+func (r *Repo) ListTGWebSessions(ctx context.Context) ([]TGWebSession, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT studio_id, access_token_enc FROM channel_accounts
+		WHERE kind = 'telegram_mtproto' AND status = 'active'
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TGWebSession
+	for rows.Next() {
+		var studioID uuid.UUID
+		var enc string
+		if err := rows.Scan(&studioID, &enc); err != nil {
+			return nil, err
+		}
+		sessionString, err := r.cipher.Decrypt(enc)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt tg-web session for studio %s: %w", studioID, err)
+		}
+		out = append(out, TGWebSession{StudioID: studioID, SessionString: sessionString})
+	}
+	return out, rows.Err()
+}
+
+// DisconnectTGWebChannel marks any active telegram_mtproto channel for a studio as disconnected.
+func (r *Repo) DisconnectTGWebChannel(ctx context.Context, studioID uuid.UUID) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE channel_accounts
+		SET status = 'disconnected', disconnected_at = now(), updated_at = now()
+		WHERE studio_id = $1 AND kind = 'telegram_mtproto' AND status <> 'disconnected'
+	`, studioID)
+	return err
+}
+
+// SetTGWebBackfillStatus records history-import progress for a studio's
+// telegram_mtproto channel so the admin UI can poll it (running/done/failed).
+// Reuses the same backfill_status/backfill_message_count columns wa-web uses
+// — they're channel-agnostic, not WhatsApp-specific.
+func (r *Repo) SetTGWebBackfillStatus(ctx context.Context, studioID uuid.UUID, status string, messageCount int) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE channel_accounts
+		SET backfill_status = $2, backfill_message_count = $3, backfill_updated_at = now()
+		WHERE studio_id = $1 AND kind = 'telegram_mtproto'
+	`, studioID, status, messageCount)
+	return err
+}
+
+// GetTGWebBackfillStatus reports the current history-import status for a studio.
+func (r *Repo) GetTGWebBackfillStatus(ctx context.Context, studioID uuid.UUID) (status string, messageCount int, err error) {
+	err = r.pool.QueryRow(ctx, `
+		SELECT backfill_status, backfill_message_count
+		FROM channel_accounts
+		WHERE studio_id = $1 AND kind = 'telegram_mtproto'
+		ORDER BY connected_at DESC
+		LIMIT 1
+	`, studioID).Scan(&status, &messageCount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "none", 0, nil
+	}
+	return status, messageCount, err
+}
+
 // ============================================================
 // contact_identities
 // ============================================================
@@ -278,7 +502,7 @@ func (r *Repo) FindOrCreateIdentity(ctx context.Context, tx pgx.Tx, studioID uui
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (studio_id, kind, value) DO UPDATE
 		  SET display_name = CASE
-		    WHEN EXCLUDED.display_name <> '' THEN EXCLUDED.display_name
+		    WHEN contact_identities.display_name = '' AND EXCLUDED.display_name <> '' THEN EXCLUDED.display_name
 		    ELSE contact_identities.display_name
 		  END,
 		  updated_at = now()
@@ -289,6 +513,29 @@ func (r *Repo) FindOrCreateIdentity(ctx context.Context, tx pgx.Tx, studioID uui
 		return nil, fmt.Errorf("upsert identity: %w", err)
 	}
 	return out, nil
+}
+
+// UpdateLeadNameIfPlaceholder replaces a lead's name/first_name with a real
+// display name learned later (e.g. from a wa-web/tg-web contact sync), but
+// only if the name currently on file is still the auto-create placeholder
+// (empty, or the bare phone digits used when no real name was known yet —
+// see the wa-web lead auto-create path in HandleInboundWAWeb). A name a
+// studio user has since edited by hand no longer matches the phone digits,
+// so this is a no-op for those — it only ever fills in a gap, never
+// clobbers a real edit.
+func (r *Repo) UpdateLeadNameIfPlaceholder(ctx context.Context, tx pgx.Tx, leadID uuid.UUID, displayName string) error {
+	if displayName == "" {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `
+		UPDATE leads
+		SET name = $2, first_name = $2, updated_at = now()
+		WHERE id = $1 AND (name = '' OR name = regexp_replace(phone, '\D', '', 'g'))
+	`, leadID, displayName)
+	if err != nil {
+		return fmt.Errorf("update lead name if placeholder: %w", err)
+	}
+	return nil
 }
 
 // ============================================================
@@ -305,7 +552,7 @@ func (r *Repo) FindOrCreateConversation(ctx context.Context, tx pgx.Tx, studioID
 		  SET updated_at = now()
 		RETURNING id, status, lead_id, assigned_to, unread_count,
 		          last_message_at, last_message_preview, last_message_direction,
-		          created_at, updated_at
+		          created_at, updated_at, ai_enabled
 	`, studioID, channelID, identityID, externalThreadID)
 	out := &Conversation{
 		StudioID:          studioID,
@@ -316,7 +563,7 @@ func (r *Repo) FindOrCreateConversation(ctx context.Context, tx pgx.Tx, studioID
 	var dir *string
 	if err := row.Scan(&out.ID, &out.Status, &out.LeadID, &out.AssignedTo, &out.UnreadCount,
 		&out.LastMessageAt, &out.LastMessagePreview, &dir,
-		&out.CreatedAt, &out.UpdatedAt); err != nil {
+		&out.CreatedAt, &out.UpdatedAt, &out.AIEnabled); err != nil {
 		return nil, fmt.Errorf("upsert conversation: %w", err)
 	}
 	if dir != nil {
@@ -357,13 +604,14 @@ func (r *Repo) ListConversations(ctx context.Context, studioID uuid.UUID, f List
 	args = append(args, f.Limit, f.Offset)
 	q := `
 		SELECT c.id, c.studio_id, c.channel_account_id, ch.kind, ch.display_handle,
-		       c.contact_identity_id, ci.display_name, ci.value, c.external_thread_id,
+		       c.contact_identity_id, COALESCE(NULLIF(l.name, ''), ci.display_name), ci.value, c.external_thread_id,
 		       c.lead_id, c.status, c.assigned_to, c.unread_count,
 		       c.last_message_at, c.last_message_preview, c.last_message_direction,
-		       c.created_at, c.updated_at
+		       c.created_at, c.updated_at, l.status, c.ai_enabled, c.dnd_enabled
 		FROM conversations c
 		JOIN channel_accounts ch ON ch.id = c.channel_account_id
 		JOIN contact_identities ci ON ci.id = c.contact_identity_id
+		LEFT JOIN leads l ON l.id = c.lead_id
 		WHERE ` + cond + `
 		ORDER BY c.last_message_at DESC
 		LIMIT $` + fmt.Sprint(len(args)-1) + ` OFFSET $` + fmt.Sprint(len(args))
@@ -388,13 +636,14 @@ func (r *Repo) ListConversations(ctx context.Context, studioID uuid.UUID, f List
 func (r *Repo) GetConversation(ctx context.Context, studioID, id uuid.UUID) (*Conversation, error) {
 	row := r.pool.QueryRow(ctx, `
 		SELECT c.id, c.studio_id, c.channel_account_id, ch.kind, ch.display_handle,
-		       c.contact_identity_id, ci.display_name, ci.value, c.external_thread_id,
+		       c.contact_identity_id, COALESCE(NULLIF(l.name, ''), ci.display_name), ci.value, c.external_thread_id,
 		       c.lead_id, c.status, c.assigned_to, c.unread_count,
 		       c.last_message_at, c.last_message_preview, c.last_message_direction,
-		       c.created_at, c.updated_at
+		       c.created_at, c.updated_at, l.status, c.ai_enabled, c.dnd_enabled
 		FROM conversations c
 		JOIN channel_accounts ch ON ch.id = c.channel_account_id
 		JOIN contact_identities ci ON ci.id = c.contact_identity_id
+		LEFT JOIN leads l ON l.id = c.lead_id
 		WHERE c.studio_id = $1 AND c.id = $2
 	`, studioID, id)
 	return scanConversationRow(row)
@@ -407,7 +656,7 @@ func scanConversationRow(row pgx.Row) (*Conversation, error) {
 		&c.ContactIdentityID, &c.ContactDisplayName, &c.ContactValue, &c.ExternalThreadID,
 		&c.LeadID, &c.Status, &c.AssignedTo, &c.UnreadCount,
 		&c.LastMessageAt, &c.LastMessagePreview, &dir,
-		&c.CreatedAt, &c.UpdatedAt); err != nil {
+		&c.CreatedAt, &c.UpdatedAt, &c.LeadStatus, &c.AIEnabled, &c.DNDEnabled); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -420,9 +669,107 @@ func scanConversationRow(row pgx.Row) (*Conversation, error) {
 	return &c, nil
 }
 
+// ListConversationIDsByChannel returns every conversation ID for a studio's
+// channel account, unpaginated — used by the post-backfill summarization
+// pass, which needs to walk every conversation once rather than page through
+// ListConversations' admin-facing 100-row cap.
+func (r *Repo) ListConversationIDsByChannel(ctx context.Context, studioID, channelAccountID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id FROM conversations
+		WHERE studio_id = $1 AND channel_account_id = $2
+	`, studioID, channelAccountID)
+	if err != nil {
+		return nil, fmt.Errorf("list conversation ids: %w", err)
+	}
+	defer rows.Close()
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// SetConversationAISummary stores an internal-only AI-generated summary of a
+// conversation's recent history, used as extra context for the AI auto-reply
+// worker. Never exposed in admin-facing JSON responses.
+func (r *Repo) SetConversationAISummary(ctx context.Context, studioID, convID uuid.UUID, summary string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE conversations
+		SET ai_context_summary = $3, ai_context_summary_updated_at = now()
+		WHERE studio_id = $1 AND id = $2
+	`, studioID, convID, summary)
+	return err
+}
+
+// SetConversationAIEnabled toggles the per-conversation AI auto-reply flag.
+func (r *Repo) SetConversationAIEnabled(ctx context.Context, studioID, convID uuid.UUID, enabled bool) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE conversations SET ai_enabled = $3, updated_at = now()
+		WHERE studio_id = $1 AND id = $2
+	`, studioID, convID, enabled)
+	return err
+}
+
+// SetAllConversationsAIEnabled is the "AI Auto-Reply" bulk toggle at the top
+// of the inbox. Turning it OFF is always safe and applies to every
+// conversation. Turning it ON deliberately excludes conversations with no
+// linked lead (imported WhatsApp Web contacts, in particular) — AI reply
+// should only ever be on for lead/campaign-sourced conversations (the ones
+// autocontact_worker explicitly enables after creating them), never
+// defaulted on in bulk for contacts that just happened to message this
+// number directly. Without this exclusion, one click here would silently
+// override that rule for every imported chat in the studio.
+func (r *Repo) SetAllConversationsAIEnabled(ctx context.Context, studioID uuid.UUID, enabled bool) error {
+	q := `UPDATE conversations SET ai_enabled = $2, updated_at = now() WHERE studio_id = $1`
+	if enabled {
+		q += ` AND lead_id IS NOT NULL`
+	}
+	_, err := r.pool.Exec(ctx, q, studioID, enabled)
+	return err
+}
+
+// SetConversationDNDEnabled toggles Do Not Disturb for a conversation directly
+// — the counterpart to leads.SetDNDEnabled for conversations with no linked
+// lead (e.g. imported WhatsApp Web contacts). ai_worker.go checks both.
+func (r *Repo) SetConversationDNDEnabled(ctx context.Context, studioID, convID uuid.UUID, enabled bool) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE conversations SET dnd_enabled = $3, updated_at = now()
+		WHERE studio_id = $1 AND id = $2
+	`, studioID, convID, enabled)
+	return err
+}
+
+// GetConversationAISummary returns the stored internal AI summary for a
+// conversation, or "" if none has been generated yet.
+func (r *Repo) GetConversationAISummary(ctx context.Context, studioID, convID uuid.UUID) (string, error) {
+	var summary string
+	err := r.pool.QueryRow(ctx, `
+		SELECT ai_context_summary FROM conversations WHERE studio_id = $1 AND id = $2
+	`, studioID, convID).Scan(&summary)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return summary, err
+}
+
 func (r *Repo) MarkConversationRead(ctx context.Context, studioID, id uuid.UUID) error {
 	_, err := r.pool.Exec(ctx, `
 		UPDATE conversations SET unread_count = 0, updated_at = now()
+		WHERE studio_id = $1 AND id = $2
+	`, studioID, id)
+	return err
+}
+
+// CloseConversation marks a conversation closed — used by the inbox's
+// "delete" action, which archives rather than hard-deletes so message
+// history is preserved.
+func (r *Repo) CloseConversation(ctx context.Context, studioID, id uuid.UUID) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE conversations SET status = 'closed', updated_at = now()
 		WHERE studio_id = $1 AND id = $2
 	`, studioID, id)
 	return err
@@ -452,10 +799,11 @@ type CreateMessageInput struct {
 // inbound). Runs inside the caller's transaction so the conversation snapshot
 // stays consistent.
 func (r *Repo) InsertMessage(ctx context.Context, tx pgx.Tx, in CreateMessageInput) (*Message, error) {
-	atts, err := json.Marshal(in.Attachments)
+	attsBytes, err := json.Marshal(in.Attachments)
 	if err != nil {
 		return nil, fmt.Errorf("marshal attachments: %w", err)
 	}
+	atts := string(attsBytes)
 	if in.SentAt.IsZero() {
 		in.SentAt = time.Now().UTC()
 	}
@@ -520,18 +868,95 @@ func (r *Repo) InsertMessage(ctx context.Context, tx pgx.Tx, in CreateMessageInp
 	return out, nil
 }
 
+// InsertMessageBackfill persists a historical message imported from a WhatsApp
+// Web chat backfill. It shares InsertMessage's dedupe key (conversation_id,
+// external_id) but deliberately never bumps unread_count and only advances
+// the conversation's last-message snapshot if the backfilled message is
+// actually newer than what's already there (GREATEST-guarded) — so importing
+// old history can never regress or spam unread counts for a conversation
+// that's already had live traffic.
+func (r *Repo) InsertMessageBackfill(ctx context.Context, tx pgx.Tx, in CreateMessageInput) (*Message, error) {
+	attsBytes, err := json.Marshal(in.Attachments)
+	if err != nil {
+		return nil, fmt.Errorf("marshal attachments: %w", err)
+	}
+	atts := string(attsBytes)
+	if in.SentAt.IsZero() {
+		in.SentAt = time.Now().UTC()
+	}
+	if in.Status == "" {
+		in.Status = MsgSent
+	}
+
+	row := tx.QueryRow(ctx, `
+		INSERT INTO messages (conversation_id, studio_id, direction, source_kind,
+		                      source_user_id, source_ref, body, attachments,
+		                      external_id, in_reply_to, status, sent_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		ON CONFLICT (conversation_id, external_id) DO NOTHING
+		RETURNING id, created_at
+	`, in.ConversationID, in.StudioID, in.Direction, in.SourceKind,
+		in.SourceUserID, in.SourceRef, in.Body, atts,
+		nullIfEmpty(in.ExternalID), nullIfEmpty(in.InReplyTo), in.Status, in.SentAt)
+
+	out := &Message{
+		ConversationID: in.ConversationID,
+		StudioID:       in.StudioID,
+		Direction:      in.Direction,
+		SourceKind:     in.SourceKind,
+		SourceUserID:   in.SourceUserID,
+		SourceRef:      in.SourceRef,
+		Body:           in.Body,
+		Attachments:    in.Attachments,
+		ExternalID:     in.ExternalID,
+		InReplyTo:      in.InReplyTo,
+		Status:         in.Status,
+		SentAt:         in.SentAt,
+	}
+	if err := row.Scan(&out.ID, &out.CreatedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Already imported or already seen live — no-op.
+			return nil, nil
+		}
+		return nil, fmt.Errorf("insert backfill message: %w", err)
+	}
+
+	preview := in.Body
+	if len(preview) > 120 {
+		preview = preview[:120]
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE conversations
+		SET last_message_at = GREATEST(last_message_at, $2),
+		    last_message_preview = CASE WHEN $2 >= last_message_at THEN $3 ELSE last_message_preview END,
+		    last_message_direction = CASE WHEN $2 >= last_message_at THEN $4 ELSE last_message_direction END,
+		    updated_at = now()
+		WHERE id = $1
+	`, in.ConversationID, in.SentAt, preview, in.Direction); err != nil {
+		return nil, fmt.Errorf("bump conversation (backfill): %w", err)
+	}
+
+	return out, nil
+}
+
 func (r *Repo) ListMessages(ctx context.Context, studioID, conversationID uuid.UUID, limit int) ([]Message, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, conversation_id, studio_id, direction, source_kind, source_user_id,
-		       source_ref, body, attachments, external_id, in_reply_to, status,
-		       failure_reason, sent_at, delivered_at, read_at, created_at
-		FROM messages
-		WHERE studio_id = $1 AND conversation_id = $2
-		ORDER BY sent_at ASC
-		LIMIT $3
+		SELECT sub.id, sub.conversation_id, sub.studio_id, sub.direction, sub.source_kind, sub.source_user_id,
+		       sub.source_ref, sub.body, sub.attachments, sub.external_id, sub.in_reply_to, sub.status,
+		       sub.failure_reason, sub.sent_at, sub.delivered_at, sub.read_at, sub.created_at
+		FROM (
+			SELECT id, conversation_id, studio_id, direction, source_kind, source_user_id,
+			       source_ref, body, attachments, external_id, in_reply_to, status,
+			       failure_reason, sent_at, delivered_at, read_at, created_at
+			FROM messages
+			WHERE studio_id = $1 AND conversation_id = $2
+			ORDER BY sent_at DESC, created_at DESC
+			LIMIT $3
+		) sub
+		ORDER BY sub.sent_at ASC, sub.created_at ASC
 	`, studioID, conversationID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list messages: %w", err)
@@ -596,12 +1021,101 @@ func (r *Repo) GetMessageByID(ctx context.Context, studioID, id uuid.UUID) (*Mes
 	return &m, nil
 }
 
+// SearchSemanticHistory finds the top-K messages from a conversation that are
+// semantically similar to the query embedding. Uses the pre-computed HNSW index
+// on messages.embedding — much faster than real-time embedding of each message.
+// Returns each match together with its cosine similarity score (0–1, higher = more similar).
+func (r *Repo) SearchSemanticHistory(ctx context.Context, studioID, conversationID uuid.UUID, queryEmbedding []float32, excludeIDs []uuid.UUID, limit int) ([]SemanticMatch, error) {
+	embStr := formatVec(queryEmbedding)
+
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, conversation_id, studio_id, direction, source_kind, source_user_id,
+		       source_ref, body, attachments, external_id, in_reply_to, status,
+		       failure_reason, sent_at, delivered_at, read_at, created_at,
+		       1 - (embedding <=> $4::vector) AS similarity_score
+		FROM messages
+		WHERE studio_id = $1
+		  AND conversation_id = $2
+		  AND embedding IS NOT NULL
+		  AND body != ''
+		  AND id != ALL($3)
+		ORDER BY embedding <=> $4::vector
+		LIMIT $5
+	`, studioID, conversationID, excludeIDs, embStr, limit)
+	if err != nil {
+		return nil, fmt.Errorf("semantic history search: %w", err)
+	}
+	defer rows.Close()
+
+	var out []SemanticMatch
+	for rows.Next() {
+		var sm SemanticMatch
+		var atts []byte
+		var srcRef, externalID, inReplyTo *string
+		if err := rows.Scan(
+			&sm.ID, &sm.ConversationID, &sm.StudioID, &sm.Direction, &sm.SourceKind,
+			&sm.SourceUserID, &srcRef, &sm.Body, &atts, &externalID, &inReplyTo, &sm.Status,
+			&sm.FailureReason, &sm.SentAt, &sm.DeliveredAt, &sm.ReadAt, &sm.CreatedAt,
+			&sm.Score,
+		); err != nil {
+			return nil, fmt.Errorf("scan semantic history: %w", err)
+		}
+		if srcRef != nil {
+			sm.SourceRef = *srcRef
+		}
+		if externalID != nil {
+			sm.ExternalID = *externalID
+		}
+		if inReplyTo != nil {
+			sm.InReplyTo = *inReplyTo
+		}
+		if len(atts) > 0 {
+			_ = json.Unmarshal(atts, &sm.Attachments)
+		}
+		out = append(out, sm)
+	}
+	return out, rows.Err()
+}
+
+// SaveMessageEmbedding persists a pre-computed embedding and LLM-classified intent/sentiment
+// on an existing message row. Called asynchronously after the message is inserted.
+func (r *Repo) SaveMessageEmbedding(ctx context.Context, messageID uuid.UUID, embedding []float32, intent string, sentiment int, confidence float32) error {
+	embStr := formatVec(embedding)
+	_, err := r.pool.Exec(ctx, `
+		UPDATE messages
+		SET embedding = $2::vector,
+		    intent = $3,
+		    sentiment = $4,
+		    sentiment_confidence = $5
+		WHERE id = $1
+	`, messageID, embStr, intent, sentiment, confidence)
+	return err
+}
+
+// formatVec serialises []float32 → "[v1,v2,...]" for pgvector.
+func formatVec(vec []float32) string {
+	if len(vec) == 0 {
+		return "[]"
+	}
+	var sb strings.Builder
+	sb.WriteByte('[')
+	for i, v := range vec {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb, "%g", v)
+	}
+	sb.WriteByte(']')
+	return sb.String()
+}
+
 // ============================================================
 // outbound_jobs
 // ============================================================
 
 func (r *Repo) EnqueueOutbound(ctx context.Context, j OutboundJob) (int64, error) {
-	atts, _ := json.Marshal(j.Attachments)
+	attsBytes, _ := json.Marshal(j.Attachments)
+	atts := string(attsBytes)
 	if j.ScheduledFor.IsZero() {
 		j.ScheduledFor = time.Now().UTC()
 	}
@@ -743,7 +1257,8 @@ func (r *Repo) ListTemplates(ctx context.Context, studioID uuid.UUID) ([]Message
 }
 
 func (r *Repo) CreateTemplate(ctx context.Context, mt *MessageTemplate) error {
-	atts, _ := json.Marshal(mt.Attachments)
+	attsBytes, _ := json.Marshal(mt.Attachments)
+	atts := string(attsBytes)
 	row := r.pool.QueryRow(ctx, `
 		INSERT INTO message_templates (studio_id, name, body, channel_kinds, attachments,
 		                               whatsapp_template_name, whatsapp_template_lang)
@@ -755,7 +1270,8 @@ func (r *Repo) CreateTemplate(ctx context.Context, mt *MessageTemplate) error {
 }
 
 func (r *Repo) UpdateTemplate(ctx context.Context, mt *MessageTemplate) error {
-	atts, _ := json.Marshal(mt.Attachments)
+	attsBytes, _ := json.Marshal(mt.Attachments)
+	atts := string(attsBytes)
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE message_templates
 		SET name = $3, body = $4, channel_kinds = $5, attachments = $6,
@@ -930,6 +1446,37 @@ func (r *Repo) ListPendingJobs(ctx context.Context, studioID uuid.UUID) ([]Pendi
 	return out, rows.Err()
 }
 
+// CancelPendingJobsForConversation deletes every still-pending outbound job
+// for a conversation (e.g. queued autocontact follow-ups) so a lead who has
+// opted out doesn't receive any further scheduled messages. Returns the
+// number of jobs removed.
+func (r *Repo) CancelPendingJobsForConversation(ctx context.Context, studioID, conversationID uuid.UUID) (int, error) {
+	tag, err := r.pool.Exec(ctx, `
+		DELETE FROM outbound_jobs
+		WHERE studio_id = $1 AND conversation_id = $2 AND status = 'pending'
+	`, studioID, conversationID)
+	if err != nil {
+		return 0, fmt.Errorf("cancel pending jobs: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// CancelPendingJobsForLead deletes every still-pending outbound job across
+// ALL of a lead's conversations (a lead may have more than one channel).
+// Used when Do Not Disturb is turned on. Returns the number of jobs removed.
+func (r *Repo) CancelPendingJobsForLead(ctx context.Context, studioID, leadID uuid.UUID) (int, error) {
+	tag, err := r.pool.Exec(ctx, `
+		DELETE FROM outbound_jobs o
+		USING conversations c
+		WHERE o.conversation_id = c.id
+		  AND o.studio_id = $1 AND c.lead_id = $2 AND o.status = 'pending'
+	`, studioID, leadID)
+	if err != nil {
+		return 0, fmt.Errorf("cancel pending jobs for lead: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 func (r *Repo) DeleteJob(ctx context.Context, studioID uuid.UUID, id int64) error {
 	tag, err := r.pool.Exec(ctx, `
 		DELETE FROM outbound_jobs
@@ -945,7 +1492,8 @@ func (r *Repo) DeleteJob(ctx context.Context, studioID uuid.UUID, id int64) erro
 }
 
 func (r *Repo) UpdateJob(ctx context.Context, studioID uuid.UUID, id int64, body string, scheduledFor time.Time, attachments []Attachment) error {
-	atts, _ := json.Marshal(attachments)
+	attsBytes, _ := json.Marshal(attachments)
+	atts := string(attsBytes)
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE outbound_jobs
 		SET body = $3, scheduled_for = $4, next_attempt_at = $4, attachments = $5
@@ -973,4 +1521,84 @@ func (r *Repo) SetJobScheduledForNow(ctx context.Context, studioID uuid.UUID, id
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (r *Repo) GetStudioMetaAppSecret(ctx context.Context, studioID uuid.UUID) (string, error) {
+	var secret string
+	err := r.pool.QueryRow(ctx, `
+		SELECT meta_app_secret FROM studios WHERE id = $1
+	`, studioID).Scan(&secret)
+	if err != nil {
+		return "", err
+	}
+	return secret, nil
+}
+
+func (r *Repo) GetStripeConfig(ctx context.Context, studioID uuid.UUID) (secretKey string, amountSGD int, name string, slug string, err error) {
+	var encKey string
+	err = r.pool.QueryRow(ctx, "SELECT stripe_secret_key, trial_amount_sgd, name, slug FROM studios WHERE id = $1", studioID).Scan(&encKey, &amountSGD, &name, &slug)
+	if err != nil {
+		return "", 0, "", "", err
+	}
+	if encKey != "" && r.cipher != nil {
+		secretKey, err = r.cipher.Decrypt(encKey)
+		if err != nil {
+			return "", 0, "", "", err
+		}
+	} else {
+		secretKey = encKey
+	}
+	return
+}
+
+type Plan struct {
+	ID           uuid.UUID
+	StudioID     uuid.UUID
+	PlanName     string
+	PriceSGD     int
+	BillingCycle string
+	Features     []string
+}
+
+func (r *Repo) ListActivePlans(ctx context.Context, studioID uuid.UUID) ([]Plan, error) {
+	cacheKey := "plans:" + studioID.String()
+	if v, ok := r.planCache.Get(cacheKey); ok {
+		if plans, ok := v.([]Plan); ok {
+			return plans, nil
+		}
+	}
+
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, studio_id, plan_name, price_sgd, billing_cycle, features
+		FROM plans
+		WHERE studio_id = $1 AND is_active = true AND plan_name != 'Trial'
+		ORDER BY price_sgd ASC
+	`, studioID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Plan
+	for rows.Next() {
+		var p Plan
+		if err := rows.Scan(&p.ID, &p.StudioID, &p.PlanName, &p.PriceSGD, &p.BillingCycle, &p.Features); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	r.planCache.Set(cacheKey, out, 5*time.Minute)
+	return out, nil
+}
+
+// LogLLMUsage inserts a fire-and-forget LLM usage record. Errors are silently
+// dropped because logging must never block the AI response path.
+func (r *Repo) LogLLMUsage(ctx context.Context, studioID uuid.UUID, provider, model string, latencyMs int, success bool, errMsg string, tokensIn, tokensOut int) {
+	_, _ = r.pool.Exec(ctx, `
+		INSERT INTO llm_usage_logs (studio_id, provider, model, latency_ms, success, error_msg, tokens_in, tokens_out)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	`, studioID, provider, model, latencyMs, success, errMsg, tokensIn, tokensOut)
 }

@@ -1,17 +1,31 @@
 package messaging
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/projectx/api/internal/decisiontree"
 	"github.com/projectx/api/internal/integrations/claude"
+	"github.com/projectx/api/internal/integrations/groq"
 	"github.com/projectx/api/internal/leads"
 	"github.com/projectx/api/internal/studios"
 )
+
+type claudeReply = claude.Reply
+
+type geminiReply struct {
+	text      string
+	tokensIn  int
+	tokensOut int
+}
 
 const (
 	aiResyncInterval = 30 * time.Second
@@ -23,21 +37,46 @@ type AIWorker struct {
 	msgSvc      *Service
 	studiosRepo *studios.Repo
 	leadsRepo   *leads.Repo
+	dtSvc       *decisiontree.Service
 	claude      *claude.Client
 	log         *slog.Logger
 	subs        map[uuid.UUID]func()
+	httpClient  *http.Client
 }
 
-func NewAIWorker(bus Bus, msgRepo *Repo, msgSvc *Service, studiosRepo *studios.Repo, leadsRepo *leads.Repo, cl *claude.Client, log *slog.Logger) *AIWorker {
-	return &AIWorker{bus: bus, msgRepo: msgRepo, msgSvc: msgSvc, studiosRepo: studiosRepo, leadsRepo: leadsRepo, claude: cl, log: log, subs: make(map[uuid.UUID]func())}
+func NewAIWorker(bus Bus, msgRepo *Repo, msgSvc *Service, studiosRepo *studios.Repo, leadsRepo *leads.Repo, dtSvc *decisiontree.Service, cl *claude.Client, log *slog.Logger) *AIWorker {
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
+	return &AIWorker{
+		bus:         bus,
+		msgRepo:     msgRepo,
+		msgSvc:      msgSvc,
+		studiosRepo: studiosRepo,
+		leadsRepo:   leadsRepo,
+		dtSvc:       dtSvc,
+		claude:      cl,
+		log:         log,
+		subs:        make(map[uuid.UUID]func()),
+		httpClient:  client,
+	}
 }
 
 func (w *AIWorker) Run(ctx context.Context) {
 	if w.claude == nil {
-		w.log.Info("claude not configured; ai worker disabled")
-		return
+		w.log.Info("claude not configured; ai worker will run using studio-configured Gemini API keys where available")
+	} else {
+		w.log.Info("claude configured; starting ai worker")
 	}
 	w.log.Info("ai worker started")
+	// Subscribe immediately so messages arriving in the first 30s are not missed.
+	w.syncSubscriptions(ctx)
 	t := time.NewTicker(aiResyncInterval)
 	defer t.Stop()
 	for {
@@ -82,16 +121,153 @@ func (w *AIWorker) listenStudio(ctx context.Context, studioID uuid.UUID, ch <-ch
 			if !ok {
 				return
 			}
-			if evt.Kind != EvtMessageReceived || evt.MessageID == nil {
-				continue
-			}
-			go func(msgID uuid.UUID) {
-				if err := w.handleMessage(ctx, studioID, msgID); err != nil {
-					w.log.Error("ai handle message", "err", err)
+			switch evt.Kind {
+			case EvtMessageReceived:
+				if evt.MessageID == nil {
+					continue
 				}
-			}(*evt.MessageID)
+				go func(msgID uuid.UUID) {
+					if err := w.handleMessage(ctx, studioID, msgID); err != nil {
+						w.log.Error("ai handle message", "err", err)
+					}
+				}(*evt.MessageID)
+			case EvtWAWebBackfillDone:
+				if evt.ChannelAccountID == nil {
+					continue
+				}
+				go func(channelAccountID uuid.UUID) {
+					if err := w.summarizeConversationsAfterBackfill(ctx, studioID, channelAccountID); err != nil {
+						w.log.Error("ai summarize conversations after backfill", "err", err)
+					}
+				}(*evt.ChannelAccountID)
+			}
 		}
 	}
+}
+
+// summarizeConversationsAfterBackfill generates and stores a short internal
+// AI summary of each conversation's recent history for a studio's
+// whatsapp_web channel, right after a chat-history import completes. The
+// summary is never shown to the admin — it's folded into buildPrompt as
+// extra context so the first live reply after connecting isn't blind to
+// everything that was discussed before.
+func (w *AIWorker) summarizeConversationsAfterBackfill(ctx context.Context, studioID, channelAccountID uuid.UUID) error {
+	convIDs, err := w.msgRepo.ListConversationIDsByChannel(ctx, studioID, channelAccountID)
+	if err != nil {
+		return fmt.Errorf("list conversations for summarization: %w", err)
+	}
+	if len(convIDs) == 0 {
+		return nil
+	}
+
+	studio, err := w.studiosRepo.GetByID(ctx, studioID)
+	if err != nil {
+		return fmt.Errorf("load studio for summarization: %w", err)
+	}
+
+	w.log.Info("ai: summarizing conversations after wa-web backfill", "studio_id", studioID, "conversations", len(convIDs))
+	for _, convID := range convIDs {
+		if err := w.summarizeConversation(ctx, studioID, convID, studio); err != nil {
+			w.log.Warn("ai: summarize conversation failed, continuing", "studio_id", studioID, "conversation_id", convID, "err", err)
+		}
+	}
+	return nil
+}
+
+// summarizeConversation fetches the last 10 messages of a conversation and
+// asks the same LLM waterfall used for replies to produce a 2-3 sentence
+// summary, stored for later use as AI reply context. No-ops (with a log
+// line, matching the reply-generation silent-failure pattern) if no LLM
+// provider is configured for the studio.
+func (w *AIWorker) summarizeConversation(ctx context.Context, studioID, convID uuid.UUID, studio *studios.Studio) error {
+	history, err := w.msgRepo.ListMessages(ctx, studioID, convID, 10)
+	if err != nil {
+		return fmt.Errorf("fetch message history: %w", err)
+	}
+	if len(history) == 0 {
+		return nil
+	}
+
+	var b strings.Builder
+	b.WriteString("Summarize this WhatsApp conversation history in 2-3 short sentences, focused on what the customer wants and where things were left off. Be concise and factual — no greeting, no filler.\n\n")
+	for _, m := range history {
+		speaker := "Customer"
+		if m.Direction == DirectionOutbound {
+			speaker = "Studio"
+		}
+		fmt.Fprintf(&b, "%s: %s\n", speaker, m.Body)
+	}
+	prompt := b.String()
+
+	summary, sourceRef := w.runSummaryWaterfall(ctx, studioID, studio, prompt)
+	if summary == "" {
+		w.log.Warn("ai: skipping conversation summary, all providers failed or not configured", "studio_id", studioID, "conversation_id", convID)
+		return nil
+	}
+	w.log.Info("ai: conversation summarized", "studio_id", studioID, "conversation_id", convID, "source", sourceRef)
+	return w.msgRepo.SetConversationAISummary(ctx, studioID, convID, strings.TrimSpace(summary))
+}
+
+// runSummaryWaterfall mirrors the reply-generation waterfall in handleMessage
+// (Groq 8B -> Groq 70B -> Gemini -> Claude) but is factored out standalone
+// since summarization has no Message/decision-tree/KB context to gather.
+func (w *AIWorker) runSummaryWaterfall(ctx context.Context, studioID uuid.UUID, studio *studios.Studio, prompt string) (text string, sourceRef string) {
+	groqKey := studio.GroqAPIKey
+	if groqKey == "" {
+		if pk, e := w.studiosRepo.GetPlatformSetting(ctx, "groq_api_key"); e == nil {
+			groqKey = pk
+		}
+	}
+	if groqKey != "" {
+		groqClient := groq.New(groqKey)
+		t0 := time.Now()
+		gr, gerr := groqClient.GenerateReply(ctx, prompt, groq.Model8B)
+		latMs := int(time.Since(t0).Milliseconds())
+		errMsg := ""
+		if gerr != nil {
+			errMsg = gerr.Error()
+		}
+		w.msgRepo.LogLLMUsage(ctx, studioID, "groq", groq.Model8B, latMs, gerr == nil && strings.TrimSpace(gr.Text) != "", errMsg, gr.TokensIn, gr.TokensOut)
+		if gerr == nil && strings.TrimSpace(gr.Text) != "" {
+			return gr.Text, "groq-8b"
+		}
+	}
+
+	apiKey := studio.GeminiAPIKey
+	if apiKey == "" {
+		if pk, e := w.studiosRepo.GetPlatformSetting(ctx, "gemini_api_key"); e == nil {
+			apiKey = pk
+		}
+	}
+	if apiKey != "" {
+		t0 := time.Now()
+		gemReply, gerr := w.generateGeminiReply(ctx, apiKey, prompt)
+		latMs := int(time.Since(t0).Milliseconds())
+		errMsg := ""
+		if gerr != nil {
+			errMsg = gerr.Error()
+		}
+		w.msgRepo.LogLLMUsage(ctx, studioID, "gemini", "gemini-2.5-flash", latMs, gerr == nil && gemReply.text != "", errMsg, gemReply.tokensIn, gemReply.tokensOut)
+		if gerr == nil && gemReply.text != "" {
+			return gemReply.text, "gemini"
+		}
+	}
+
+	if w.claude != nil {
+		t0 := time.Now()
+		cr, cerr := w.claude.GenerateReply(ctx, prompt)
+		latMs := int(time.Since(t0).Milliseconds())
+		errMsg := ""
+		if cerr != nil {
+			errMsg = cerr.Error()
+		}
+		w.msgRepo.LogLLMUsage(ctx, studioID, "claude", "claude-haiku-4-5", latMs, cerr == nil && cr.Text != "", errMsg, cr.TokensIn, cr.TokensOut)
+		if cerr == nil && cr.Text != "" {
+			return cr.Text, "claude"
+		}
+	}
+
+	return "", ""
 }
 
 // analyzeSentiment returns: sentiment (-1=negative, 0=neutral, 1=positive), confidence score, and detected keywords
@@ -135,6 +311,22 @@ func (w *AIWorker) analyzeSentiment(text string) (int, float64, []string) {
 	return sentiment, confidence, detectedKeywords
 }
 
+// stopKeywords are opt-out words a lead can reply with to end all automated
+// contact. Matched as the entire trimmed message (case-insensitive) so
+// ordinary sentences containing "stop" (e.g. "stop by later") don't trigger it.
+var stopKeywords = map[string]bool{
+	"stop":        true,
+	"unsubscribe": true,
+	"opt out":     true,
+	"optout":      true,
+}
+
+func isStopMessage(body string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(body))
+	normalized = strings.Trim(normalized, ".!? ")
+	return stopKeywords[normalized]
+}
+
 func (w *AIWorker) handleMessage(ctx context.Context, studioID uuid.UUID, messageID uuid.UUID) error {
 	msg, err := w.msgRepo.GetMessageByID(ctx, studioID, messageID)
 	if err != nil {
@@ -166,12 +358,6 @@ func (w *AIWorker) handleMessage(ctx context.Context, studioID uuid.UUID, messag
 		return nil
 	}
 
-	// Only reply on WhatsApp and Facebook Messenger
-	if channel.Kind != KindWhatsAppMeta && channel.Kind != KindMessengerMeta {
-		w.log.Debug("skipping ai reply", "channel", channel.Kind, "reason", "not whatsapp or messenger")
-		return nil
-	}
-
 	// Get lead associated with this conversation (if any)
 	var lead *leads.Lead
 	if conv.LeadID != nil {
@@ -181,30 +367,684 @@ func (w *AIWorker) handleMessage(ctx context.Context, studioID uuid.UUID, messag
 		}
 	}
 
-	// Analyze sentiment and keywords
-	sentiment, confidence, keywords := w.analyzeSentiment(msg.Body)
-	w.log.Debug("sentiment analyzed", "message_id", msg.ID, "sentiment", sentiment, "confidence", confidence, "keywords", keywords)
-
-	// Generate AI response with context
-	prompt := w.buildPrompt(msg, conv, lead, sentiment, keywords)
-	resp, err := w.claude.GenerateReply(ctx, prompt)
-	if err != nil {
-		return fmt.Errorf("claude generate: %w", err)
+	// AI auto-reply is off for this conversation — studio user hasn't enabled it yet.
+	if !conv.AIEnabled {
+		w.log.Info("ai worker: ai_enabled=false — no reply sent", "conversation", conv.ID)
+		return nil
 	}
 
-	w.log.Info("ai response generated", "message_id", msg.ID, "response_len", len(resp), "channel", channel.Kind)
+	// Do Not Disturb: either the lead/conversation already opted in to DND
+	// (manually, or from a previous "stop"), or this message is itself an
+	// opt-out keyword. Either way: enable DND, cancel every pending scheduled
+	// message for this conversation, and never send a reply. Pipeline status
+	// is left untouched. Conversations with no linked lead (e.g. imported
+	// WhatsApp Web contacts) carry DND on conversations.dnd_enabled instead —
+	// see SetConversationDNDEnabled.
+	if (lead != nil && lead.DNDEnabled) || conv.DNDEnabled || isStopMessage(msg.Body) {
+		if lead != nil && !lead.DNDEnabled {
+			if err := w.leadsRepo.SetDNDEnabled(ctx, studioID, lead.ID, true); err != nil {
+				w.log.Error("stop keyword: failed to enable dnd", "lead", lead.ID, "err", err)
+			}
+		} else if lead == nil && !conv.DNDEnabled {
+			if err := w.msgRepo.SetConversationDNDEnabled(ctx, studioID, conv.ID, true); err != nil {
+				w.log.Error("stop keyword: failed to enable conversation dnd", "conversation", conv.ID, "err", err)
+			}
+		}
+		if _, err := w.msgRepo.CancelPendingJobsForConversation(ctx, studioID, conv.ID); err != nil {
+			w.log.Error("dnd: failed to cancel pending jobs", "conversation", conv.ID, "err", err)
+		}
+		w.log.Info("ai worker: dnd active — no reply sent", "conversation", conv.ID, "lead_id", conv.LeadID)
+		return nil
+	}
 
-	// Enqueue outbound reply
-	if _, err := w.msgRepo.EnqueueOutbound(ctx, OutboundJob{
+	if lead != nil {
+		// Skip AI only for mid-flow stages where the bot owns the conversation
+		// (date/time selection, plan selection, reason collection).
+		// At awaiting_interest and awaiting_options the bot only reacts to exact
+		// numeric/keyword choices; anything else (questions, greetings) falls to AI.
+		stage := lead.AutoContactStage
+		w.log.Info("ai worker: lead stage check", "lead_id", lead.ID, "stage", stage, "lead_status", string(lead.Status), "message", msg.Body)
+		botOwnedStage := stage != "" &&
+			stage != "completed" &&
+			stage != "awaiting_options" &&
+			stage != "awaiting_interest"
+		if botOwnedStage {
+			w.log.Info("ai worker: skipping — bot owns this stage", "lead", lead.ID, "stage", stage)
+			return nil
+		}
+		// At awaiting_options / awaiting_interest / no-stage: skip only if the bot
+		// already queued an outbound reply for this specific inbound message.
+		// Checks any non-customer source, not just 'automation' — the auto-contact
+		// stage machine's SendTrialPaymentLink (triggered from here for exact "1"/
+		// trial replies during awaiting_options) enqueues with source_kind 'ai', so
+		// filtering on 'automation' alone let this same reply through twice.
+		var botReplied bool
+		_ = w.msgRepo.Pool().QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM outbound_jobs
+				WHERE conversation_id = $1 AND source_kind IN ('automation', 'ai')
+				AND created_at >= $2
+			)
+		`, conv.ID, msg.CreatedAt).Scan(&botReplied)
+		w.log.Info("ai worker: bot_replied check", "lead_id", lead.ID, "bot_replied", botReplied, "msg_created_at", msg.CreatedAt)
+		if botReplied {
+			w.log.Info("ai worker: skipping — automation already replied", "lead", lead.ID)
+			return nil
+		}
+	}
+
+	// Get studio to access knowledge base and timezone
+	studio, err := w.studiosRepo.GetByID(ctx, studioID)
+	if err != nil {
+		return fmt.Errorf("fetch studio for ai context: %w", err)
+	}
+
+	// Fetch active plans for this studio
+	plans, err := w.msgRepo.ListActivePlans(ctx, studioID)
+	if err != nil {
+		w.log.Error("fetch plans for ai context failed", "err", err)
+		plans = []Plan{} // fallback to empty
+	}
+
+	// Keyword sentiment as initial fallback
+	sentiment, confidence, keywords := w.analyzeSentiment(msg.Body)
+
+	// Resolve Gemini API key (studio key takes priority over platform key)
+	apiKey := studio.GeminiAPIKey
+	if apiKey == "" {
+		if platformKey, err := w.studiosRepo.GetPlatformSetting(ctx, "gemini_api_key"); err == nil && platformKey != "" {
+			apiKey = platformKey
+		}
+	}
+
+	// Fetch last 15 messages as the immediate recent window. 5 was too
+	// short — the model would forget questions/offers it made only a few
+	// turns back and repeat itself.
+	history, err := w.msgRepo.ListMessages(ctx, studioID, conv.ID, 15)
+	if err != nil {
+		w.log.Error("fetch message history for ai context failed", "err", err)
+		history = []Message{*msg}
+	}
+
+	// Send greeting on the very first inbound message of a new conversation.
+	// "First" = only one message in history (the current one) and a greeting is configured.
+	if len(history) == 1 && studio.GreetingMessage != "" {
+		greetingBody := studio.GreetingMessage
+		// Substitute the same placeholders supported in reply templates.
+		greetingBody = strings.ReplaceAll(greetingBody, "{{studio_name}}", studio.Name)
+		if lead != nil {
+			greetingBody = strings.ReplaceAll(greetingBody, "{{lead_name}}", lead.Name)
+			greetingBody = strings.ReplaceAll(greetingBody, "{{lead_first_name}}", lead.FirstName)
+			greetingBody = strings.ReplaceAll(greetingBody, "{{lead_status}}", string(lead.Status))
+		}
+		if _, sendErr := w.msgRepo.EnqueueOutbound(ctx, OutboundJob{
+			StudioID:       studioID,
+			ConversationID: conv.ID,
+			Body:           greetingBody,
+			SourceKind:     SourceAI,
+			SourceRef:      "greeting",
+			ScheduledFor:   time.Now().UTC(),
+		}); sendErr != nil {
+			w.log.Error("failed to enqueue greeting message", "err", sendErr, "conv_id", conv.ID)
+		} else {
+			w.bus.Publish(ctx, Event{
+				Kind:     EvtOutboundJobEnqueued,
+				StudioID: studioID,
+			})
+			// Greeting is the only reply for a brand-new conversation.
+			// Stop here — don't also fire the decision tree or AI.
+			return nil
+		}
+	}
+
+	var kbChunks []string
+	var semanticHistory []SemanticMatch
+	var intent string
+	// kbConfident tracks whether retrieval found high-confidence chunks.
+	// Used to gate hallucination: if false, the prompt instructs the AI not to guess.
+	kbConfident := false
+
+	// Keyword override: runs before LLM classification so it works even when Gemini is not configured.
+	// "trail" is a typo for "trial" that LLMs classify as hiking/off-topic.
+	lowerBody := strings.ToLower(msg.Body)
+	if strings.Contains(lowerBody, "trail") ||
+		strings.Contains(lowerBody, "book trial") || strings.Contains(lowerBody, "book a trial") {
+		intent = "booking_inquiry"
+		w.log.Debug("intent set to booking_inquiry by keyword", "message_id", msg.ID)
+	}
+
+	if apiKey != "" && msg.Body != "" {
+		// Step 1+2 in parallel: classify intent and expand query simultaneously.
+		// Neither depends on the other so we save one full LLM round-trip.
+		type classifyResult struct {
+			intent    string
+			sentiment int
+			conf      float64
+		}
+		classifyCh := make(chan classifyResult, 1)
+		expandCh := make(chan string, 1)
+		go func() {
+			i, s, c := studios.ClassifyIntent(ctx, apiKey, msg.Body)
+			classifyCh <- classifyResult{i, s, c}
+		}()
+		go func() {
+			expandCh <- studios.ExpandQuery(ctx, apiKey, msg.Body)
+		}()
+
+		cr := <-classifyCh
+		if intent == "" {
+			intent = cr.intent
+		}
+		sentiment = cr.sentiment
+		confidence = cr.conf
+		keywords = []string{intent}
+		// Re-apply keyword override in case LLM classification overwrote it.
+		if strings.Contains(lowerBody, "trail") ||
+			strings.Contains(lowerBody, "book trial") || strings.Contains(lowerBody, "book a trial") {
+			intent = "booking_inquiry"
+		}
+
+		expandedQuery := <-expandCh
+
+		// Step 3: Embed the expanded query.
+		queryVec, err := studios.GetGeminiEmbedding(ctx, apiKey, expandedQuery)
+		if err == nil {
+			// Step 3b: Persist original message embedding fully async — not needed for this response.
+			capturedIntent, capturedSentiment, capturedConf := intent, sentiment, confidence
+			go func() {
+				saveCtx := context.Background()
+				vec, origErr := studios.GetGeminiEmbedding(saveCtx, apiKey, msg.Body)
+				if origErr != nil {
+					vec = queryVec
+				}
+				if saveErr := w.msgRepo.SaveMessageEmbedding(saveCtx, msg.ID, vec, capturedIntent, capturedSentiment, float32(capturedConf)); saveErr != nil {
+					w.log.Warn("save message embedding failed", "message_id", msg.ID, "err", saveErr)
+				}
+			}()
+
+			// Step 4+8 in parallel: KB retrieval/rerank and semantic history simultaneously.
+			type kbResult struct {
+				chunks    []string
+				confident bool
+			}
+			kbCh := make(chan kbResult, 1)
+			semHistCh := make(chan []SemanticMatch, 1)
+
+			go func() {
+				// Hybrid retrieval (8 candidates) → rerank to top 4 directly.
+				// MMR diversity pass removed: saves 4-6 sequential embedding API calls per request.
+				matched, searchErr := w.studiosRepo.SearchKnowledgeChunksHybrid(ctx, studioID, queryVec, expandedQuery, "all", 8)
+				if searchErr != nil || len(matched) == 0 {
+					if searchErr != nil {
+						w.log.Warn("failed to search knowledge chunks", "studio_id", studioID, "err", searchErr)
+					}
+					kbCh <- kbResult{}
+					return
+				}
+				reranked := studios.RerankChunks(ctx, apiKey, msg.Body, matched, 4)
+				kbCh <- kbResult{chunks: reranked, confident: len(reranked) >= 2}
+			}()
+
+			go func() {
+				recentIDs := make([]uuid.UUID, len(history))
+				for i, m := range history {
+					recentIDs[i] = m.ID
+				}
+				semHist, semErr := w.msgRepo.SearchSemanticHistory(ctx, studioID, conv.ID, queryVec, recentIDs, 3)
+				if semErr != nil || len(semHist) == 0 {
+					semHistCh <- nil
+					return
+				}
+				var filtered []SemanticMatch
+				for _, sm := range semHist {
+					if sm.Score >= 0.75 {
+						filtered = append(filtered, sm)
+					}
+				}
+				semHistCh <- filtered
+			}()
+
+			kb := <-kbCh
+			kbChunks = kb.chunks
+			kbConfident = kb.confident
+			if len(kbChunks) > 0 {
+				w.log.Info("rag pipeline complete", "studio_id", studioID, "final", len(kbChunks), "confident", kbConfident)
+			}
+
+			if semResults := <-semHistCh; len(semResults) > 0 {
+				semanticHistory = semResults
+				w.log.Info("retrieved semantic history", "studio_id", studioID, "count", len(semanticHistory))
+			}
+		} else {
+			w.log.Warn("failed to get message embedding for rag", "studio_id", studioID, "err", err)
+		}
+	}
+
+	// A bare numeric reply ("1"/"2") to one of the platform's own booking-flow
+	// menus (trial/member, then become-a-member yes/no) must be interpreted
+	// against whatever menu was most recently sent — not against an unrelated
+	// studio-authored decision tree node that happens to also key on "1"/"2"
+	// (e.g. a pricing FAQ tree). Without this, a customer answering "become a
+	// member?" with "2" could get matched to a stale tree node instead of
+	// "not right now", derailing the conversation. Skip the tree whenever our
+	// own option detector has a definitive read for the lead's current status.
+	skipTreeForOptionReply := false
+	if lead != nil {
+		if _, ok := w.detectOptionChoice(msg.Body, lead.Status); ok {
+			skipTreeForOptionReply = true
+			w.log.Info("ai worker: bare option reply detected, skipping decision tree", "lead_id", lead.ID, "status", lead.Status, "message", msg.Body)
+		}
+	}
+
+	// Decision tree: check if the studio has an active tree that matches this message.
+	// If it does, use the tree reply directly and skip the AI call entirely.
+	if w.dtSvc != nil && !skipTreeForOptionReply {
+		leadStatus := ""
+		if lead != nil {
+			leadStatus = string(lead.Status)
+		}
+		treeResult, treeErr := w.dtSvc.TraverseActiveTree(ctx, studioID, msg.Body, leadStatus)
+		w.log.Info("decision tree traversal", "studio_id", studioID, "lead_status", leadStatus, "msg", msg.Body, "tree_found", treeResult != nil, "matched", treeResult != nil && treeResult.Matched, "err", treeErr)
+		if treeErr != nil {
+			w.log.Warn("decision tree traversal failed", "studio_id", studioID, "err", treeErr)
+		} else if treeResult != nil && treeResult.Matched {
+			// Pipeline: change lead status before or alongside reply.
+			if treeResult.TargetStatus != "" && lead != nil {
+				newStatus := leads.LeadStatus(treeResult.TargetStatus)
+				if newStatus.Valid() {
+					if err := w.leadsRepo.UpdateStatus(ctx, studioID, lead.ID, newStatus); err != nil {
+						w.log.Warn("decision tree status change failed", "studio_id", studioID, "err", err)
+					} else {
+						w.log.Info("decision tree changed lead status", "studio_id", studioID, "lead_id", lead.ID, "status", treeResult.TargetStatus)
+					}
+				}
+			}
+
+			switch treeResult.Action {
+			case decisiontree.ActionReply, decisiontree.ActionChangeStatus:
+				// ActionChangeStatus can also carry a reply — handle both the same way.
+				reply := treeResult.Reply
+				if reply == "" {
+					// change_status with no reply: silently update status and stop.
+					return nil
+				}
+				if lead != nil {
+					reply = strings.ReplaceAll(reply, "{{lead_name}}", lead.Name)
+					reply = strings.ReplaceAll(reply, "{{lead_first_name}}", lead.FirstName)
+					reply = strings.ReplaceAll(reply, "{{lead_status}}", string(lead.Status))
+				}
+				if studio != nil {
+					reply = strings.ReplaceAll(reply, "{{studio_name}}", studio.Name)
+				}
+				w.log.Info("decision tree matched, using tree reply", "studio_id", studioID, "node", treeResult.NodeLabel)
+				_, err = w.msgRepo.EnqueueOutbound(ctx, OutboundJob{
+					StudioID:       studioID,
+					ConversationID: msg.ConversationID,
+					Body:           reply,
+					SourceKind:     SourceAI,
+					SourceRef:      "decision_tree",
+					ScheduledFor:   time.Now().UTC(),
+				})
+				if err != nil {
+					return fmt.Errorf("enqueue tree reply: %w", err)
+				}
+				w.bus.Publish(ctx, Event{
+					Kind:           EvtOutboundJobEnqueued,
+					StudioID:       studioID,
+					ConversationID: msg.ConversationID,
+				})
+				return nil
+			case decisiontree.ActionEscalate:
+				w.log.Info("decision tree matched, escalating to human", "studio_id", studioID, "node", treeResult.NodeLabel)
+				return nil
+			case decisiontree.ActionBookTrial:
+				// Tree matched a booking node — drive the lead into the options menu.
+				w.log.Info("decision tree matched book_trial, triggering booking flow", "studio_id", studioID, "node", treeResult.NodeLabel)
+				if lead != nil {
+					if err := w.leadsRepo.UpdateAutoContactStage(ctx, studioID, lead.ID, "awaiting_options"); err != nil {
+						w.log.Warn("book_trial: failed to set awaiting_options", "lead", lead.ID, "err", err)
+					}
+				}
+				bookBody := treeResult.Reply
+				if bookBody == "" {
+					bookBody = "Great! Please select an option:\n1. Book a Trial\n2. Become a Member"
+				}
+				if lead != nil {
+					bookBody = strings.ReplaceAll(bookBody, "{{lead_name}}", lead.Name)
+					bookBody = strings.ReplaceAll(bookBody, "{{lead_first_name}}", lead.FirstName)
+				}
+				_, err = w.msgRepo.EnqueueOutbound(ctx, OutboundJob{
+					StudioID:       studioID,
+					ConversationID: msg.ConversationID,
+					Body:           bookBody,
+					SourceKind:     SourceAutomation,
+					SourceRef:      fmt.Sprintf("decision_tree:%s", treeResult.NodeLabel),
+					ScheduledFor:   time.Now().UTC(),
+				})
+				if err != nil {
+					return fmt.Errorf("enqueue book_trial reply: %w", err)
+				}
+				w.bus.Publish(ctx, Event{
+					Kind:           EvtOutboundJobEnqueued,
+					StudioID:       studioID,
+					ConversationID: msg.ConversationID,
+				})
+				return nil
+			case decisiontree.ActionSendLink:
+				// Treat send_link like reply — use the node's reply template.
+				reply := treeResult.Reply
+				if reply == "" {
+					return nil
+				}
+				if lead != nil {
+					reply = strings.ReplaceAll(reply, "{{lead_name}}", lead.Name)
+					reply = strings.ReplaceAll(reply, "{{lead_first_name}}", lead.FirstName)
+				}
+				w.log.Info("decision tree matched send_link, sending reply", "studio_id", studioID, "node", treeResult.NodeLabel)
+				_, err = w.msgRepo.EnqueueOutbound(ctx, OutboundJob{
+					StudioID:       studioID,
+					ConversationID: msg.ConversationID,
+					Body:           reply,
+					SourceKind:     SourceAI,
+					SourceRef:      "decision_tree",
+					ScheduledFor:   time.Now().UTC(),
+				})
+				if err != nil {
+					return fmt.Errorf("enqueue send_link reply: %w", err)
+				}
+				w.bus.Publish(ctx, Event{
+					Kind:           EvtOutboundJobEnqueued,
+					StudioID:       studioID,
+					ConversationID: msg.ConversationID,
+				})
+				return nil
+			}
+		} else if treeResult == nil && w.dtSvc != nil {
+			w.log.Debug("decision tree: no active tree found", "studio_id", studioID, "lead_status", func() string {
+				if lead != nil {
+					return string(lead.Status)
+				}
+				return ""
+			}())
+		} else if treeResult != nil && !treeResult.Matched {
+			w.log.Debug("decision tree: no node matched", "studio_id", studioID, "message", msg.Body)
+		}
+	}
+
+	// Booking shortcut: when customer says "trail"/"book trial" and the bot isn't mid-flow,
+	// jump directly into the automation stage machine instead of using AI.
+	if intent == "booking_inquiry" {
+		notInActiveFlow := true
+		if lead != nil {
+			stage := lead.AutoContactStage
+			notInActiveFlow = stage == "" || stage == "completed" || stage == "awaiting_interest" || stage == "awaiting_options"
+		}
+		if notInActiveFlow {
+			// Update stage if we have a lead
+			if lead != nil {
+				if err := w.leadsRepo.UpdateAutoContactStage(ctx, studioID, lead.ID, "awaiting_options"); err != nil {
+					w.log.Warn("booking shortcut: failed to set awaiting_options", "lead", lead.ID, "err", err)
+				}
+			}
+			sourceRef := "booking_shortcut"
+			if lead != nil {
+				sourceRef = fmt.Sprintf("lead:%s:booking_shortcut", lead.ID)
+			}
+			body := "Great! Please select an option:\n1. Book a Trial\n2. Become a Member"
+			if _, err := w.msgRepo.EnqueueOutbound(ctx, OutboundJob{
+				StudioID:       studioID,
+				ConversationID: conv.ID,
+				Body:           body,
+				SourceKind:     SourceAutomation,
+				SourceRef:      sourceRef,
+				ScheduledFor:   time.Now().UTC(),
+			}); err != nil {
+				return fmt.Errorf("booking shortcut enqueue: %w", err)
+			}
+			w.bus.Publish(ctx, Event{
+				Kind:           EvtOutboundJobEnqueued,
+				StudioID:       studioID,
+				ConversationID: conv.ID,
+			})
+			w.log.Info("booking shortcut triggered, skipping AI", "conv", conv.ID)
+			return nil
+		}
+	}
+
+	// "Yes to trial" shortcut: skip AI and send the payment link directly
+	// when either (a) the customer explicitly asks to buy/pay — that alone
+	// is unambiguous, no prior offer needed — or (b) they give a bare
+	// affirmation ("yes"/"keen") replying to a bot message that had just
+	// offered a trial.
+	if lead != nil {
+		lowerMsg := strings.ToLower(strings.TrimSpace(msg.Body))
+		explicitPurchaseIntent := strings.Contains(lowerMsg, "buy") ||
+			strings.Contains(lowerMsg, "purchase") ||
+			strings.Contains(lowerMsg, "how to pay") ||
+			strings.Contains(lowerMsg, "how do i pay") ||
+			strings.Contains(lowerMsg, "payment link") ||
+			strings.Contains(lowerMsg, "pay for") ||
+			strings.Contains(lowerMsg, "checkout")
+		isAffirmative := lowerMsg == "yes" || lowerMsg == "yeah" || lowerMsg == "sure" ||
+			lowerMsg == "ok" || lowerMsg == "okay" || lowerMsg == "yep" || lowerMsg == "yup" ||
+			lowerMsg == "y" || lowerMsg == "keen" || lowerMsg == "im keen" || lowerMsg == "i'm keen" ||
+			strings.HasPrefix(lowerMsg, "yes ") || strings.HasPrefix(lowerMsg, "sure ") ||
+			strings.Contains(lowerMsg, "i'm keen") || strings.Contains(lowerMsg, "im keen") ||
+			strings.Contains(lowerMsg, "interested")
+
+		if explicitPurchaseIntent {
+			firstName := lead.FirstName
+			if firstName == "" {
+				firstName = lead.Name
+			}
+			if _, err := w.msgSvc.SendTrialPaymentLink(ctx, studioID, conv.ID, conv.LeadID, firstName); err != nil {
+				w.log.Error("buy-trial: failed to send payment link", "err", err, "conv", conv.ID)
+			} else {
+				w.bus.Publish(ctx, Event{Kind: EvtOutboundJobEnqueued, StudioID: studioID, ConversationID: conv.ID})
+				w.log.Info("buy-trial shortcut triggered (explicit purchase intent)", "conv", conv.ID)
+			}
+			return nil
+		}
+
+		if isAffirmative {
+			// Check the last few outbound messages (not just the single most
+			// recent one) — back-to-back bot replies can otherwise push a
+			// genuine trial offer just out of view.
+			checked := 0
+			for i := len(history) - 1; i >= 0 && checked < 3; i-- {
+				m := history[i]
+				if m.Direction != DirectionOutbound {
+					continue
+				}
+				checked++
+				lastBot := strings.ToLower(m.Body)
+				offeredTrial := strings.Contains(lastBot, "trial") &&
+					(strings.Contains(lastBot, "would you like") ||
+						strings.Contains(lastBot, "book a trial") ||
+						strings.Contains(lastBot, "sign up for a trial") ||
+						strings.Contains(lastBot, "try") ||
+						strings.Contains(lastBot, "experience"))
+				if offeredTrial {
+					firstName := lead.FirstName
+					if firstName == "" {
+						firstName = lead.Name
+					}
+					if _, err := w.msgSvc.SendTrialPaymentLink(ctx, studioID, conv.ID, conv.LeadID, firstName); err != nil {
+						w.log.Error("yes-to-trial: failed to send payment link", "err", err, "conv", conv.ID)
+					} else {
+						w.bus.Publish(ctx, Event{Kind: EvtOutboundJobEnqueued, StudioID: studioID, ConversationID: conv.ID})
+						w.log.Info("yes-to-trial shortcut triggered", "conv", conv.ID)
+					}
+					return nil
+				}
+			}
+		}
+	}
+
+	// "Yes to upgrade" shortcut: an existing member replies affirmatively to
+	// the AI's own offer (added above, in the pricing_question/member response
+	// strategy) to change or upgrade their plan. Skip AI and send the plan list
+	// directly, mirroring the yes-to-trial shortcut above.
+	if lead != nil && lead.Status == leads.StatusMember {
+		lowerMsg := strings.ToLower(strings.TrimSpace(msg.Body))
+		isAffirmative := lowerMsg == "yes" || lowerMsg == "yeah" || lowerMsg == "sure" ||
+			lowerMsg == "ok" || lowerMsg == "okay" || lowerMsg == "yep" || lowerMsg == "yup" ||
+			lowerMsg == "y" || strings.HasPrefix(lowerMsg, "yes ") || strings.HasPrefix(lowerMsg, "sure ")
+		if isAffirmative {
+			for i := len(history) - 1; i >= 0; i-- {
+				m := history[i]
+				if m.Direction == DirectionOutbound {
+					lastBot := strings.ToLower(m.Body)
+					offeredChange := (strings.Contains(lastBot, "change") || strings.Contains(lastBot, "upgrade") || strings.Contains(lastBot, "switch")) &&
+						(strings.Contains(lastBot, "plan") || strings.Contains(lastBot, "membership"))
+					if offeredChange {
+						plans, err := w.msgRepo.ListActivePlans(ctx, studioID)
+						if err != nil || len(plans) == 0 {
+							w.log.Warn("yes-to-upgrade: no active plans to offer", "conv", conv.ID, "err", err)
+							return nil
+						}
+						if err := w.leadsRepo.UpdateAutoContactStage(ctx, studioID, lead.ID, "awaiting_plan_change_selection"); err != nil {
+							w.log.Warn("yes-to-upgrade: failed to set stage", "lead", lead.ID, "err", err)
+						}
+						body := formatPlanReprompt("Sure! Which plan would you like to switch to?", plans)
+						if _, err := w.msgRepo.EnqueueOutbound(ctx, OutboundJob{
+							StudioID:       studioID,
+							ConversationID: conv.ID,
+							Body:           body,
+							SourceKind:     SourceAutomation,
+							SourceRef:      fmt.Sprintf("lead:%s:plan_change_options", lead.ID),
+							ScheduledFor:   time.Now().UTC(),
+						}); err != nil {
+							w.log.Error("yes-to-upgrade: failed to enqueue plan list", "err", err, "conv", conv.ID)
+						} else {
+							w.bus.Publish(ctx, Event{Kind: EvtOutboundJobEnqueued, StudioID: studioID, ConversationID: conv.ID})
+							w.log.Info("yes-to-upgrade shortcut triggered", "conv", conv.ID)
+						}
+						return nil
+					}
+					break
+				}
+			}
+		}
+	}
+
+	// Generate AI response with context
+	aiContextSummary, err := w.msgRepo.GetConversationAISummary(ctx, studioID, conv.ID)
+	if err != nil {
+		w.log.Warn("fetch conversation ai summary failed", "err", err)
+		aiContextSummary = ""
+	}
+	prompt := w.buildPrompt(history, semanticHistory, conv, lead, studio, plans, sentiment, keywords, kbChunks, intent, kbConfident, aiContextSummary)
+
+	// Waterfall: Groq 8B → Groq 70B → Gemini → Claude
+	var resp string
+	var sourceRef string
+
+	// 1. Try Groq (fast + cheap) — use studio key first, fall back to platform key
+	groqKey := studio.GroqAPIKey
+	if groqKey == "" {
+		if pk, e := w.studiosRepo.GetPlatformSetting(ctx, "groq_api_key"); e == nil {
+			groqKey = pk
+		}
+	}
+	if groqKey != "" {
+		groqClient := groq.New(groqKey)
+		w.log.Info("generating ai reply using groq 8b", "studio_id", studioID, "message_id", msg.ID)
+		t0 := time.Now()
+		gr, gerr := groqClient.GenerateReply(ctx, prompt, groq.Model8B)
+		latMs := int(time.Since(t0).Milliseconds())
+		errMsg := ""
+		if gerr != nil {
+			errMsg = gerr.Error()
+		}
+		w.msgRepo.LogLLMUsage(ctx, studioID, "groq", groq.Model8B, latMs, gerr == nil && len(strings.TrimSpace(gr.Text)) >= 15, errMsg, gr.TokensIn, gr.TokensOut)
+		if gerr == nil && len(strings.TrimSpace(gr.Text)) >= 15 {
+			resp = gr.Text
+			sourceRef = "groq-8b"
+		} else {
+			w.log.Info("groq 8b failed or short, trying 70b", "studio_id", studioID, "err", gerr)
+			t0 = time.Now()
+			gr70, gerr70 := groqClient.GenerateReply(ctx, prompt, groq.Model70B)
+			latMs = int(time.Since(t0).Milliseconds())
+			errMsg = ""
+			if gerr70 != nil {
+				errMsg = gerr70.Error()
+			}
+			w.msgRepo.LogLLMUsage(ctx, studioID, "groq", groq.Model70B, latMs, gerr70 == nil && gr70.Text != "", errMsg, gr70.TokensIn, gr70.TokensOut)
+			if gerr70 == nil && gr70.Text != "" {
+				resp = gr70.Text
+				sourceRef = "groq-70b"
+			}
+		}
+	}
+
+	// 2. Gemini fallback
+	if resp == "" && apiKey != "" {
+		w.log.Info("generating ai reply using gemini", "studio_id", studioID, "message_id", msg.ID)
+		t0 := time.Now()
+		var gemReply geminiReply
+		gemReply, err = w.generateGeminiReply(ctx, apiKey, prompt)
+		latMs := int(time.Since(t0).Milliseconds())
+		resp = gemReply.text
+		sourceRef = "gemini"
+		errMsg := ""
+		if err != nil {
+			errMsg = err.Error()
+		}
+		w.msgRepo.LogLLMUsage(ctx, studioID, "gemini", "gemini-2.5-flash", latMs, err == nil && resp != "", errMsg, gemReply.tokensIn, gemReply.tokensOut)
+	}
+
+	// 3. Claude fallback
+	if resp == "" && w.claude != nil {
+		w.log.Info("generating ai reply using claude", "studio_id", studioID, "message_id", msg.ID)
+		t0 := time.Now()
+		var cr claudeReply
+		cr, err = w.claude.GenerateReply(ctx, prompt)
+		latMs := int(time.Since(t0).Milliseconds())
+		resp = cr.Text
+		sourceRef = "claude"
+		errMsg := ""
+		if err != nil {
+			errMsg = err.Error()
+		}
+		w.msgRepo.LogLLMUsage(ctx, studioID, "claude", "claude-haiku-4-5", latMs, err == nil && resp != "", errMsg, cr.TokensIn, cr.TokensOut)
+	}
+
+	if resp == "" {
+		w.log.Warn("skipping ai reply: all providers failed or not configured", "studio_id", studioID)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("ai generate reply failed: %w", err)
+	}
+
+	// Post-process: strip motivation questions when customer clearly wants to book.
+	// Groq 8B ignores the prompt instruction reliably, so we enforce it here.
+	if intent == "booking_inquiry" {
+		resp = stripMotivationQuestions(resp)
+	}
+
+	w.log.Info("ai response generated", "message_id", msg.ID, "response_len", len(resp), "channel", channel.Kind, "model", sourceRef)
+
+	// Enqueue outbound reply. Delayed slightly so the reply doesn't feel
+	// instant/robotic to the recipient.
+	_, err = w.msgRepo.EnqueueOutbound(ctx, OutboundJob{
 		StudioID:       studioID,
 		ConversationID: msg.ConversationID,
 		Body:           resp,
 		SourceKind:     SourceAI,
-		SourceRef:      "claude",
-		ScheduledFor:   time.Now().UTC(),
-	}); err != nil {
+		SourceRef:      sourceRef,
+		ScheduledFor:   time.Now().UTC().Add(20 * time.Second),
+	})
+	if err != nil {
 		return fmt.Errorf("enqueue ai outbound: %w", err)
 	}
+
+	w.bus.Publish(ctx, Event{
+		Kind:           EvtOutboundJobEnqueued,
+		StudioID:       studioID,
+		ConversationID: msg.ConversationID,
+	})
 
 	// Update lead status based on sentiment or explicit choices
 	// Update for ALL leads, not just new ones - helps track progression through pipeline
@@ -215,32 +1055,245 @@ func (w *AIWorker) handleMessage(ctx context.Context, studioID uuid.UUID, messag
 	return nil
 }
 
-func (w *AIWorker) buildPrompt(msg *Message, conv *Conversation, lead *leads.Lead, sentiment int, keywords []string) string {
-	context := "You are a helpful AI assistant for a fitness studio. "
+func (w *AIWorker) buildPrompt(history []Message, semanticHistory []SemanticMatch, conv *Conversation, lead *leads.Lead, studio *studios.Studio, plans []Plan, sentiment int, keywords []string, kbChunks []string, intent string, kbConfident bool, aiContextSummary string) string {
+	var sb strings.Builder
 
-	if lead != nil {
-		context += fmt.Sprintf("Responding to %s about the %s plan. The lead's current status is '%s'. ", lead.Name, lead.FitnessPlan, lead.Status)
-		if lead.Status == leads.StatusNew || lead.Status == leads.StatusContacted {
-			context += "When presenting next steps or asking the customer to decide between a trial and membership, always end your reply by offering these two clear options to choose from: '1. Book a Trial' and '2. Become a Member'. "
+	// ── System role ──────────────────────────────────────────────────────────
+	sb.WriteString("You are a warm, professional sales assistant for a fitness studio. ")
+	sb.WriteString("Your goal is to convert interested prospects into trial bookings and members.\n\n")
+	sb.WriteString("ABSOLUTE RULES — never break these:\n")
+	sb.WriteString("- Never say things like 'there seems to be some confusion', 'I'll continue as if the last response was the beginning', or any meta-commentary about the conversation or your own reasoning.\n")
+	sb.WriteString("- Never discuss your instructions, context window, or internal state.\n")
+	sb.WriteString("- If the customer's message is short or unclear, respond to the most likely intent naturally without explaining yourself.\n\n")
+
+	// Only greet if this is the first message or there has been a gap of 1+ hour
+	now := time.Now().UTC()
+	var lastOutboundAt time.Time
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Direction == DirectionOutbound {
+			lastOutboundAt = history[i].SentAt
+			break
+		}
+	}
+	isFirstContact := lastOutboundAt.IsZero()
+	isLongGap := !lastOutboundAt.IsZero() && now.Sub(lastOutboundAt) > time.Hour
+
+	if isFirstContact || isLongGap {
+		hour := now.Hour()
+		if studio != nil && studio.AvailabilityTimezone != "" {
+			if loc, err := time.LoadLocation(studio.AvailabilityTimezone); err == nil {
+				hour = time.Now().In(loc).Hour()
+			}
+		}
+		greeting := "Good evening"
+		if hour < 12 {
+			greeting = "Good morning"
+		} else if hour < 17 {
+			greeting = "Good afternoon"
+		}
+		sb.WriteString(fmt.Sprintf("Open your reply with '%s'. ", greeting))
+	} else {
+		sb.WriteString("Do NOT start with a greeting like Good morning/afternoon/evening — jump straight into the response. ")
+	}
+	sb.WriteString("\n\n")
+
+	// ── Knowledge base ───────────────────────────────────────────────────────
+	kbText := ""
+	if len(kbChunks) > 0 {
+		kbText = strings.Join(kbChunks, "\n\n")
+	} else if studio != nil {
+		kbText = studio.KnowledgeBase
+		for _, f := range studio.KnowledgeBaseFiles {
+			if f.Text != "" {
+				kbText += fmt.Sprintf("\n\nDocument (%s):\n%s", f.Name, f.Text)
+			}
 		}
 	}
 
-	context += "Be friendly, professional, and helpful. Keep responses concise (1-3 sentences). "
-
-	// Tailor response based on sentiment
-	if sentiment == 1 {
-		context += "The customer seems interested - try to book a trial session or get more details. "
-	} else if sentiment == -1 {
-		context += "The customer seems hesitant or uninterested - try to understand their concerns and address them. "
-	} else {
-		context += "Ask clarifying questions to understand their needs and interest level. "
+	if kbText != "" {
+		sb.WriteString("KNOWLEDGE BASE:\n\"\"\"\n")
+		sb.WriteString(kbText)
+		sb.WriteString("\n\"\"\"\n")
+		sb.WriteString("Use the knowledge base above to answer factual questions. If it doesn't cover the exact question, use what context you have and answer helpfully anyway — do NOT say you don't know or that someone will follow up. ")
+		sb.WriteString("You can see your own earlier replies in RECENT CONVERSATION below — do NOT restate pricing, promotions, or programme details you've already told the customer in this conversation; assume they remember it and only repeat something if they explicitly ask again. Keep replies short and move the conversation forward instead of re-explaining what's already covered.\n\n")
 	}
 
-	return fmt.Sprintf("%s\nCustomer message: %s\n\nRespond naturally and try to move the conversation toward booking a trial or getting commitment.", context, msg.Body)
+	// ── Plans ────────────────────────────────────────────────────────────────
+	if len(plans) > 0 {
+		sb.WriteString("MEMBERSHIP PLANS (SGD):\n")
+		for _, p := range plans {
+			sb.WriteString(fmt.Sprintf("  • %s — S$%.2f/%s | %s\n",
+				p.PlanName, float64(p.PriceSGD)/100.0, p.BillingCycle, strings.Join(p.Features, ", ")))
+		}
+		sb.WriteString("\n")
+	}
+
+	// ── Lead context ─────────────────────────────────────────────────────────
+	if lead != nil {
+		if lead.Status == leads.StatusMember && lead.FitnessPlan != "" {
+			sb.WriteString(fmt.Sprintf("LEAD: %s | status: %s | CURRENT PLAN: %s at S$%.2f/month (this is their actual active membership — state these exact details if they ask what their plan is)\n",
+				lead.Name, lead.Status, lead.FitnessPlan, lead.MonthlyFee))
+		} else {
+			sb.WriteString(fmt.Sprintf("LEAD: %s | plan interest: %s | status: %s\n", lead.Name, lead.FitnessPlan, lead.Status))
+		}
+		// Bot automation owns the numbered-choice flow while it is active.
+		// AI answers questions freely but must not inject its own options during
+		// bot-managed stages — the bot will present the right choices at the right time.
+		botOwnsFlow := lead.AutoContactStage != "" && lead.AutoContactStage != "completed"
+
+		switch lead.Status {
+		case leads.StatusNew, leads.StatusContacted:
+			if !botOwnsFlow {
+				// No active bot flow — AI may append booking options, but only if the
+				// customer hasn't already seen them and is asking about booking.
+				optionsAlreadySent := false
+				for _, m := range history {
+					if m.Direction == DirectionOutbound &&
+						(strings.Contains(m.Body, "Book a Trial") || strings.Contains(m.Body, "Become a Member")) {
+						optionsAlreadySent = true
+						break
+					}
+				}
+				customerAsksAboutBooking := false
+				if len(history) > 0 {
+					lastMsg := history[len(history)-1]
+					if lastMsg.Direction == DirectionInbound {
+						lt := strings.ToLower(lastMsg.Body)
+						customerAsksAboutBooking = strings.Contains(lt, "book") ||
+							strings.Contains(lt, "trial") ||
+							strings.Contains(lt, "trail") || // common typo for "trial"
+							strings.Contains(lt, "join") ||
+							strings.Contains(lt, "member") ||
+							strings.Contains(lt, "sign up") ||
+							strings.Contains(lt, "enroll") ||
+							strings.Contains(lt, "register")
+					}
+				}
+				if !optionsAlreadySent || customerAsksAboutBooking {
+					sb.WriteString("END your reply with these exact options:\n  1. Book a Trial\n  2. Become a Member\n\n")
+				}
+			}
+		case leads.StatusTrialBooked:
+			if !botOwnsFlow {
+				// Only show follow-up options if not already shown recently.
+				optionsAlreadySent := false
+				for _, m := range history {
+					if m.Direction == DirectionOutbound &&
+						strings.Contains(m.Body, "ready to become a member") {
+						optionsAlreadySent = true
+						break
+					}
+				}
+				if !optionsAlreadySent {
+					sb.WriteString("END your reply with these exact options:\n  1. Yes, I am ready to become a member!\n  2. Not right now\n\n")
+				}
+			}
+		}
+	}
+
+	// ── Intent-aware instructions ─────────────────────────────────────────────
+	sb.WriteString("RESPONSE STRATEGY:\n")
+	switch intent {
+	case "pricing_question":
+		if lead != nil && lead.Status == leads.StatusMember {
+			sb.WriteString("Customer is an existing member asking about their own plan/membership. State their exact current plan name and monthly fee from the CURRENT PLAN line in LEAD context above. Then ask if they'd like to change or upgrade their plan — if yes, they can pick from the MEMBERSHIP PLANS listed above. Do not pitch a trial, they're already a member.\n")
+		} else {
+			sb.WriteString("Customer is asking about price. Give the exact price from the plans above. Then show the value: what they get for that price. End with a soft CTA to book a trial.\n")
+		}
+	case "booking_inquiry":
+		sb.WriteString("Customer wants to book. Make it easy — confirm what they want and immediately offer next steps (ask for preferred date/time or provide a booking link). Be enthusiastic. Do NOT ask motivation or goal questions — they already decided to book.\n")
+	case "objection":
+		sb.WriteString("Customer has a concern or objection. Acknowledge it empathetically, address it with facts from the knowledge base, then redirect toward a trial (low commitment).\n")
+	case "ready_to_buy":
+		sb.WriteString("Customer is ready. Do NOT delay — confirm the next action clearly and immediately. Help them complete the purchase or booking right now.\n")
+	case "off_topic":
+		sb.WriteString("Customer is asking something unrelated to the studio. Politely acknowledge, then steer the conversation back to how the studio can help them.\n")
+	default:
+		if lead != nil && lead.Status == leads.StatusMember {
+			sb.WriteString("Customer is an existing member. Answer their question helpfully and directly using the CURRENT PLAN and knowledge base context above. If their question is at all about their plan/membership, state their current plan and monthly fee, then ask if they'd like to change or upgrade it. Do not ask fitness-goal/qualifying questions, they've already signed up.\n")
+		} else {
+			sb.WriteString("Answer the question helpfully and concisely. Then ask one qualifying question to understand their fitness goals.\n")
+		}
+	}
+
+	// Sentiment overlay
+	switch sentiment {
+	case 1:
+		if lead != nil && lead.Status == leads.StatusTrialBooked {
+			sb.WriteString("Tone: enthusiastic — they're interested, push gently for membership commitment.\n")
+		} else {
+			sb.WriteString("Tone: enthusiastic — they're interested, push gently for a trial booking.\n")
+		}
+	case -1:
+		sb.WriteString("Tone: empathetic — they seem hesitant. Listen first, address concerns, lower the commitment bar (trial is free/cheap).\n")
+	default:
+		isExistingMember := lead != nil && lead.Status == leads.StatusMember
+		if intent != "booking_inquiry" && intent != "ready_to_buy" && !isExistingMember {
+			sb.WriteString("Tone: curious and friendly — ask one open question to uncover their motivation.\n")
+		} else if isExistingMember {
+			sb.WriteString("Tone: warm and direct — they're already a member, just answer helpfully without prospecting questions.\n")
+		}
+	}
+	sb.WriteString("Keep the reply concise: 2–4 sentences maximum. Never make up facts.\n\n")
+
+	// ── Semantic history (high-confidence past context) ───────────────────────
+	if len(semanticHistory) > 0 {
+		sb.WriteString("--- RELEVANT PAST CONTEXT (earlier messages semantically similar to today's query) ---\n")
+		for _, sm := range semanticHistory {
+			label := "Assistant (earlier)"
+			if sm.Direction == DirectionInbound {
+				label = "Customer (earlier)"
+			}
+			sb.WriteString(fmt.Sprintf("%s [similarity %.2f]: %s\n", label, sm.Score, sm.Body))
+		}
+		sb.WriteString("\n")
+	}
+
+	// ── Prior context summary (from imported chat history, if any) ───────────
+	if aiContextSummary != "" {
+		sb.WriteString("--- SUMMARY OF EARLIER HISTORY (before this recent window) ---\n")
+		sb.WriteString(aiContextSummary)
+		sb.WriteString("\n\n")
+	}
+
+	// ── Recent conversation window ────────────────────────────────────────────
+	sb.WriteString("--- RECENT CONVERSATION ---\n")
+	for _, m := range history {
+		if m.Direction == DirectionInbound {
+			sb.WriteString(fmt.Sprintf("Customer: %s\n", m.Body))
+		} else {
+			sb.WriteString(fmt.Sprintf("Assistant: %s\n", m.Body))
+		}
+	}
+	sb.WriteString("Assistant: ")
+
+	return sb.String()
 }
 
-func (w *AIWorker) detectOptionChoice(body string) (leads.LeadStatus, bool) {
+func (w *AIWorker) detectOptionChoice(body string, status leads.LeadStatus) (leads.LeadStatus, bool) {
 	text := strings.ToLower(strings.TrimSpace(body))
+
+	if status == leads.StatusTrialBooked {
+		hasMemberKeywords := text == "1" ||
+			strings.Contains(text, "become a member") ||
+			strings.Contains(text, "ready") ||
+			strings.Contains(text, "yes")
+		hasDroppedKeywords := text == "2" ||
+			strings.Contains(text, "not right now") ||
+			strings.Contains(text, "no") ||
+			strings.Contains(text, "later")
+
+		if hasMemberKeywords && hasDroppedKeywords {
+			return "", false
+		}
+		if hasMemberKeywords {
+			return leads.StatusMember, true
+		}
+		if hasDroppedKeywords {
+			return leads.StatusDropped, true
+		}
+		return "", false
+	}
 
 	hasTrialKeywords := text == "1" ||
 		strings.Contains(text, "book a trial") ||
@@ -249,7 +1302,9 @@ func (w *AIWorker) detectOptionChoice(body string) (leads.LeadStatus, bool) {
 		strings.Contains(text, "take trial") ||
 		strings.Contains(text, "trial booked") ||
 		strings.Contains(text, "trial booking") ||
-		strings.Contains(text, "trial")
+		strings.Contains(text, "trial") ||
+		strings.Contains(text, "book trail") ||
+		strings.Contains(text, "trail") // common typo for "trial"
 
 	hasMemberKeywords := text == "2" ||
 		strings.Contains(text, "become a member") ||
@@ -274,7 +1329,7 @@ func (w *AIWorker) detectOptionChoice(body string) (leads.LeadStatus, bool) {
 
 func (w *AIWorker) updateLeadStatus(ctx context.Context, studioID uuid.UUID, lead *leads.Lead, body string, sentiment int, confidence float64) {
 	// 1. Check for explicit option choices first
-	if targetStatus, ok := w.detectOptionChoice(body); ok {
+	if targetStatus, ok := w.detectOptionChoice(body, lead.Status); ok {
 		if lead.Status != targetStatus {
 			err := w.leadsRepo.UpdateStatus(ctx, studioID, lead.ID, targetStatus)
 			if err != nil {
@@ -290,7 +1345,7 @@ func (w *AIWorker) updateLeadStatus(ctx context.Context, studioID uuid.UUID, lea
 	}
 
 	// 2. Only update if confidence is high enough
-	if confidence < 0.6 {
+	if confidence < 0.7 {
 		return
 	}
 
@@ -360,8 +1415,7 @@ func (w *AIWorker) scheduleTrialFollowup(ctx context.Context, studioID uuid.UUID
 		w.log.Warn("could not find conversation for lead to schedule followup", "lead", lead.ID, "err", err)
 	}
 
-	first := firstName(lead.Name)
-	body := fmt.Sprintf("Hi %s, we hope you're enjoying your trial! Are you ready to take the next step and become a member? Please select an option:\n1. Book a Trial\n2. Become a Member", first)
+	body := "Hi {{contact.first_name}}, we hope you're enjoying your trial! Are you ready to take the next step and become a member? Please select an option:\n1. Yes, I am ready to become a member!\n2. Not right now"
 
 	if _, err := w.msgRepo.EnqueueOutbound(ctx, OutboundJob{
 		StudioID:       studioID,
@@ -373,4 +1427,165 @@ func (w *AIWorker) scheduleTrialFollowup(ctx context.Context, studioID uuid.UUID
 	}); err != nil {
 		w.log.Error("enqueue 1-day trial followup failed", "lead", lead.ID, "err", err)
 	}
+}
+
+func (w *AIWorker) generateGeminiReply(ctx context.Context, apiKey string, prompt string) (geminiReply, error) {
+	models := []string{"gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite"}
+	for _, model := range models {
+		r, err := w.tryGeminiModel(ctx, apiKey, model, prompt)
+		if err == nil {
+			return r, nil
+		}
+		w.log.Warn("gemini model failed, trying next", "model", model, "err", err)
+	}
+	return geminiReply{}, fmt.Errorf("all Gemini models failed")
+}
+
+func (w *AIWorker) tryGeminiModel(ctx context.Context, apiKey string, model string, prompt string) (geminiReply, error) {
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", model, apiKey)
+
+	reqBody, err := json.Marshal(map[string]any{
+		"contents": []map[string]any{
+			{
+				"parts": []map[string]any{
+					{"text": prompt},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return geminiReply{}, err
+	}
+
+	var lastErr error
+	backoff := 500 * time.Millisecond
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewBuffer(reqBody))
+		if err != nil {
+			cancel()
+			return geminiReply{}, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := w.httpClient.Do(req)
+		if err != nil {
+			cancel()
+			lastErr = err
+			w.log.Warn("gemini api attempt failed", "attempt", attempt, "err", err)
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+
+		respBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		cancel()
+
+		if err != nil {
+			lastErr = err
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+
+		if resp.StatusCode >= 400 {
+			lastErr = fmt.Errorf("gemini API error (HTTP %d): %s", resp.StatusCode, string(respBytes))
+			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+				w.log.Warn("gemini api transient response error", "attempt", attempt, "status", resp.StatusCode)
+				time.Sleep(backoff)
+				backoff *= 2
+				continue
+			}
+			return geminiReply{}, lastErr
+		}
+
+		var res struct {
+			Candidates []struct {
+				Content struct {
+					Parts []struct {
+						Text string `json:"text"`
+					} `json:"parts"`
+				} `json:"content"`
+			} `json:"candidates"`
+			UsageMetadata struct {
+				PromptTokenCount     int `json:"promptTokenCount"`
+				CandidatesTokenCount int `json:"candidatesTokenCount"`
+			} `json:"usageMetadata"`
+		}
+
+		if err := json.Unmarshal(respBytes, &res); err != nil {
+			return geminiReply{}, err
+		}
+
+		if len(res.Candidates) == 0 || len(res.Candidates[0].Content.Parts) == 0 {
+			return geminiReply{}, fmt.Errorf("empty response from Gemini API")
+		}
+
+		return geminiReply{
+			text:      res.Candidates[0].Content.Parts[0].Text,
+			tokensIn:  res.UsageMetadata.PromptTokenCount,
+			tokensOut: res.UsageMetadata.CandidatesTokenCount,
+		}, nil
+	}
+
+	return geminiReply{}, fmt.Errorf("gemini API call failed after 3 attempts: %w", lastErr)
+}
+
+// stripMotivationQuestions removes sentences asking about fitness goals/motivations
+// when the customer has already expressed intent to book — the LLM ignores the prompt
+// instruction reliably, so we enforce it at the output layer.
+func stripMotivationQuestions(resp string) string {
+	motivationPhrases := []string{
+		"what motivated you",
+		"what are your fitness goals",
+		"what are your goals",
+		"goals or motivations",
+		"are you looking to lose weight",
+		"are you looking to gain",
+		"gain strength",
+		"improve overall health",
+		"why do you want to",
+		"tell me what motivated",
+		"before we get started, can you tell me",
+		"before we proceed, can you tell",
+		"before we book",
+		"before we do that, can you tell",
+	}
+
+	lower := strings.ToLower(resp)
+	hasMotivation := false
+	for _, phrase := range motivationPhrases {
+		if strings.Contains(lower, phrase) {
+			hasMotivation = true
+			break
+		}
+	}
+	if !hasMotivation {
+		return resp
+	}
+
+	// Split on ". " and filter out offending sentences.
+	parts := strings.Split(resp, ". ")
+	var kept []string
+	for _, part := range parts {
+		partLower := strings.ToLower(part)
+		remove := false
+		for _, phrase := range motivationPhrases {
+			if strings.Contains(partLower, phrase) {
+				remove = true
+				break
+			}
+		}
+		if !remove {
+			kept = append(kept, part)
+		}
+	}
+
+	result := strings.TrimSpace(strings.Join(kept, ". "))
+	if result == "" {
+		return "I'd be happy to book a trial for you! What date and time works best for you?"
+	}
+	return result
 }

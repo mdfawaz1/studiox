@@ -1,14 +1,21 @@
 'use client';
 
 import { useState, type ReactNode } from 'react';
-import { Clock, Plug } from 'lucide-react';
+import { useRouter, useSearchParams, usePathname } from 'next/navigation';
+import { Clock, Plug, CheckCircle2, X } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { cn } from '@/lib/cn';
-import type { ChannelAccount, ChannelKind } from '@/lib/types';
+import type { ChannelAccount, ChannelKind, Studio } from '@/lib/types';
 import { ChannelList } from './ChannelList';
 import { ConnectWhatsApp } from './ConnectWhatsApp';
+import { ConnectWhatsAppWeb } from './ConnectWhatsAppWeb';
 import { ConnectMetaChannel } from './ConnectMetaChannel';
+import { ConnectGoogleAds } from './ConnectGoogleAds';
+import { ConnectTwilio } from './ConnectTwilio';
+import { ConnectX } from './ConnectX';
+import { ConnectTelegram } from './ConnectTelegram';
+import { ConnectTelegramWeb } from './ConnectTelegramWeb';
 
 interface TabDef {
   kind: ChannelKind;
@@ -20,9 +27,9 @@ interface TabDef {
 
 const TABS: TabDef[] = [
   {
-    kind: 'whatsapp_meta',
-    label: 'WhatsApp',
-    brand: '#25D366',
+    kind: 'whatsapp_web',
+    label: 'WhatsApp (QR)',
+    brand: '#128C7E',
     status: 'available',
   },
   {
@@ -38,35 +45,101 @@ const TABS: TabDef[] = [
     status: 'available',
   },
   {
+    kind: 'google_ads',
+    label: 'Google Ads',
+    brand: '#4285F4',
+    status: 'available',
+  },
+  {
+    kind: 'sms',
+    label: 'Twilio SMS',
+    brand: '#F22F46',
+    status: 'available',
+  },
+  {
     kind: 'x_dm',
     label: 'X (Twitter) DMs',
     brand: '#000000',
-    status: 'coming_soon',
-    comingSoonNote: (
-      <>
-        X moved to pay-per-use in Feb 2026 (~$0.01 per outbound DM). We&rsquo;ll
-        wire this after Meta channels are live and per-studio volume justifies
-        the cost.
-      </>
-    ),
+    status: 'available',
+  },
+  {
+    kind: 'whatsapp_meta',
+    label: 'WhatsApp (Meta)',
+    brand: '#25D366',
+    status: 'available',
+  },
+  {
+    kind: 'telegram_mtproto',
+    label: 'Telegram (QR)',
+    brand: '#26A5E4',
+    status: 'available',
+  },
+  {
+    kind: 'telegram',
+    label: 'Telegram (Bot)',
+    brand: '#26A5E4',
+    status: 'available',
   },
 ];
 
 export function ChannelTabs({
   studioId,
   channels,
+  studio,
 }: {
   studioId: string;
   channels: ChannelAccount[];
+  studio: Studio;
 }) {
-  const [active, setActive] = useState<ChannelKind>('whatsapp_meta');
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
+  const VALID_KINDS = TABS.map((t) => t.kind);
+  const initialActive = (VALID_KINDS.includes(searchParams.get('channel') as ChannelKind)
+    ? searchParams.get('channel')
+    : 'whatsapp_web') as ChannelKind;
+
+  const [active, setActive] = useState<ChannelKind>(initialActive);
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+
+  const handleSetActive = (kind: ChannelKind) => {
+    setActive(kind);
+    const p = new URLSearchParams(searchParams.toString());
+    p.set('channel', kind);
+    router.replace(`${pathname}?${p.toString()}`, { scroll: false });
+  };
+
+  const showToast = (message: string, type: 'success' | 'error' = 'success') => {
+    setToast({ message, type });
+  };
+
   const activeTab = TABS.find((t) => t.kind === active)!;
   const channelsForTab = channels.filter((c) => c.kind === active);
 
   return (
     <div className="space-y-6">
-      {/* Tab bar */}
-      <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 dark:border-slate-800">
+      {/* Mobile: a plain select picks the channel instead of wrapping pills */}
+      <div className="sm:hidden">
+        <select
+          value={active}
+          onChange={(e) => handleSetActive(e.target.value as ChannelKind)}
+          className="w-full rounded-xl border border-white/20 bg-white/20 px-3 py-2.5 text-sm font-semibold text-slate-700 backdrop-blur-xl focus:outline-none dark:border-white/5 dark:bg-neutral-900/20 dark:text-slate-200"
+          suppressHydrationWarning
+        >
+          {TABS.map((t) => {
+            const connectedCount = channels.filter((c) => c.kind === t.kind).length;
+            return (
+              <option key={t.kind} value={t.kind}>
+                {t.label}{connectedCount > 0 ? ` (${connectedCount})` : ''}{t.status === 'coming_soon' ? ' — Soon' : ''}
+              </option>
+            );
+          })}
+        </select>
+      </div>
+
+      {/* Tab bar (sm and up) */}
+      <div className="hidden flex-wrap items-center gap-2 rounded-2xl border border-white/20 bg-white/20 p-1.5 backdrop-blur-xl dark:border-white/5 dark:bg-neutral-900/20 sm:flex">
         {TABS.map((t) => {
           const isActive = t.kind === active;
           const connectedCount = channels.filter((c) => c.kind === t.kind).length;
@@ -74,36 +147,41 @@ export function ChannelTabs({
             <button
               key={t.kind}
               type="button"
-              onClick={() => setActive(t.kind)}
+              onClick={() => handleSetActive(t.kind)}
               className={cn(
-                'group relative flex items-center gap-2 px-4 py-2.5 text-sm font-medium transition-colors',
+                'group relative flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold transition-all duration-200',
                 isActive
-                  ? 'text-slate-900 dark:text-slate-100'
-                  : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200',
+                  ? 'text-white shadow-sm'
+                  : 'text-slate-500 hover:bg-white/30 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-white/5 dark:hover:text-slate-200',
               )}
+              style={isActive ? { background: t.brand, boxShadow: `0 2px 12px ${t.brand}55` } : {}}
               suppressHydrationWarning
             >
               <span
                 aria-hidden
-                className="h-2 w-2 rounded-full"
-                style={{ background: t.brand }}
+                className={cn('h-2 w-2 rounded-full transition-all', isActive ? 'bg-white/70' : '')}
+                style={!isActive ? { background: t.brand } : {}}
               />
               {t.label}
               {connectedCount > 0 && (
-                <span className="rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">
+                <span className={cn(
+                  'rounded-full px-1.5 py-0.5 text-[10px] font-bold',
+                  isActive
+                    ? 'bg-white/25 text-white'
+                    : 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300'
+                )}>
                   {connectedCount}
                 </span>
               )}
               {t.status === 'coming_soon' && (
-                <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+                <span className={cn(
+                  'rounded-full px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider',
+                  isActive
+                    ? 'bg-white/20 text-white'
+                    : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'
+                )}>
                   Soon
                 </span>
-              )}
-              {isActive && (
-                <span
-                  className="absolute inset-x-2 -bottom-px h-0.5 rounded-full"
-                  style={{ background: t.brand }}
-                />
               )}
             </button>
           );
@@ -111,15 +189,37 @@ export function ChannelTabs({
       </div>
 
       {/* Tab content */}
-      {activeTab.status === 'available' ? (
+      {active === 'google_ads' ? (
+        <ConnectGoogleAds studio={studio} channels={channels.filter(c => c.kind === 'google_ads')} showToast={showToast} />
+      ) : activeTab.status === 'available' ? (
         <AvailablePanel
           studioId={studioId}
           channels={channelsForTab}
           kind={activeTab.kind}
           label={activeTab.label}
+          showToast={showToast}
         />
       ) : (
         <ComingSoonPanel tab={activeTab} />
+      )}
+
+      {/* Custom Floating Toast Notification */}
+      {toast && (
+        <div className="fixed bottom-6 right-6 z-50 p-4 rounded-2xl border border-emerald-500/30 bg-white/90 dark:bg-zinc-900/90 backdrop-blur-xl shadow-2xl flex items-center gap-3 animate-in slide-in-from-bottom-5 fade-in duration-300 min-w-[320px]">
+          <div className="h-8 w-8 rounded-xl bg-emerald-500/10 text-emerald-500 flex items-center justify-center shrink-0">
+            <CheckCircle2 className="w-5 h-5" />
+          </div>
+          <div className="flex-1 text-left">
+            <p className="text-xs font-black uppercase tracking-wider text-zinc-800 dark:text-zinc-100">Success</p>
+            <p className="text-[10px] text-zinc-550 dark:text-zinc-400 font-semibold mt-0.5">{toast.message}</p>
+          </div>
+          <button 
+            onClick={() => setToast(null)} 
+            className="text-zinc-400 hover:text-zinc-650 dark:hover:text-white p-1 rounded-lg transition-colors"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
       )}
     </div>
   );
@@ -130,11 +230,13 @@ function AvailablePanel({
   channels,
   kind,
   label,
+  showToast,
 }: {
   studioId: string;
   channels: ChannelAccount[];
   kind: ChannelKind;
   label: string;
+  showToast: (msg: string, type?: 'success' | 'error') => void;
 }) {
   return (
     <div className="grid gap-6 lg:grid-cols-3">
@@ -154,14 +256,24 @@ function AvailablePanel({
             </div>
           </Card>
         ) : (
-          <ChannelList studioId={studioId} channels={channels} />
+          <ChannelList studioId={studioId} channels={channels} showToast={showToast} />
         )}
       </div>
       <div className="space-y-6">
         {kind === 'whatsapp_meta' ? (
-          <ConnectWhatsApp studioId={studioId} />
+          <ConnectWhatsApp studioId={studioId} showToast={showToast} />
+        ) : kind === 'whatsapp_web' ? (
+          <ConnectWhatsAppWeb studioId={studioId} showToast={showToast} />
+        ) : kind === 'sms' ? (
+          <ConnectTwilio studioId={studioId} showToast={showToast} />
+        ) : kind === 'x_dm' ? (
+          <ConnectX studioId={studioId} onSuccess={() => {}} showToast={showToast} />
+        ) : kind === 'telegram' ? (
+          <ConnectTelegram studioId={studioId} showToast={showToast} />
+        ) : kind === 'telegram_mtproto' ? (
+          <ConnectTelegramWeb studioId={studioId} connected={channels.length > 0} showToast={showToast} />
         ) : (
-          <ConnectMetaChannel studioId={studioId} kind={kind} />
+          <ConnectMetaChannel studioId={studioId} kind={kind} showToast={showToast} />
         )}
       </div>
     </div>

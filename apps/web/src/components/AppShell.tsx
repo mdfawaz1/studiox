@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import {
+  BarChart2,
   Building2,
   Home,
   Inbox,
@@ -16,8 +17,20 @@ import {
   Settings,
   Sparkles,
   X,
+  CreditCard,
+  Database,
+  ChevronLeft,
+  ChevronRight,
+  HelpCircle,
+  Sun,
+  Moon,
+  CheckCircle2,
+  AlertCircle,
+  Zap,
+  GitBranch,
+  Network,
 } from 'lucide-react';
-import { useEffect, useState, type CSSProperties, type ReactNode } from 'react';
+import { useEffect, useState, useRef, type CSSProperties, type ReactNode } from 'react';
 import { Button } from '@/components/ui/Button';
 import { api } from '@/lib/api';
 import { brandInitials, withAlpha } from '@/lib/color';
@@ -31,28 +44,83 @@ interface NavItem {
   match?: (pathname: string) => boolean;
 }
 
-function navItemsFor(me: Me): NavItem[] {
+function navItemsFor(me: Me, currentPath: string): NavItem[] {
+  // Check if currently viewing a studio (both super_admin and studio_admin can do this)
+  const studioMatch = currentPath.match(/\/admin\/studios\/([^/]+)/);
+  const currentStudioId = studioMatch?.[1];
+
   if (me.role === 'super_admin') {
+    // If viewing a specific studio, show full studio-level nav (super admins managing a studio get all access)
+    if (currentStudioId) {
+      const base = `/admin/studios/${currentStudioId}`;
+      return [
+        { href: base,                     label: 'Dashboard',     icon: <Home className="h-[18px] w-[18px]" />,           match: (p) => p === base },
+        { href: `${base}/inbox`,          label: 'Inbox',         icon: <MessagesSquare className="h-[18px] w-[18px]" />, match: (p) => p.startsWith(`${base}/inbox`) },
+        { href: `${base}/pipeline`,       label: 'Pipeline',      icon: <GitBranch className="h-[18px] w-[18px]" />,      match: (p) => p.startsWith(`${base}/pipeline`) },
+        { href: `${base}/campaigns`,      label: 'Campaigns',     icon: <Megaphone className="h-[18px] w-[18px]" />,      match: (p) => p.startsWith(`${base}/campaigns`) },
+        { href: `${base}/leads`,          label: 'Leads',         icon: <Inbox className="h-[18px] w-[18px]" />,          match: (p) => p.startsWith(`${base}/leads`) },
+        { href: `${base}/social-planner`, label: 'Social Planner',icon: <Sparkles className="h-[18px] w-[18px]" />,       match: (p) => p.startsWith(`${base}/social-planner`) },
+        { href: `${base}/payments`,       label: 'Payments',      icon: <CreditCard className="h-[18px] w-[18px]" />,     match: (p) => p.startsWith(`${base}/payments`) },
+        { href: `${base}/channels`,       label: 'Channels',      icon: <Plug className="h-[18px] w-[18px]" />,           match: (p) => p.startsWith(`${base}/channels`) },
+        { href: `${base}/knowledge-base`,  label: 'Knowledge Base', icon: <Database className="h-[18px] w-[18px]" />,      match: (p) => p.startsWith(`${base}/knowledge-base`) },
+        { href: `${base}/decision-trees`, label: 'Decision Trees', icon: <Network className="h-[18px] w-[18px]" />,       match: (p) => p.startsWith(`${base}/decision-trees`) },
+        { href: `${base}/settings`,       label: 'Settings',       icon: <Settings className="h-[18px] w-[18px]" />,      match: (p) => p.startsWith(`${base}/settings`) },
+      ];
+    }
+
+    // Otherwise show top-level super admin nav
     return [
       {
         href: '/admin/studios',
         label: 'Studios',
         icon: <Building2 className="h-[18px] w-[18px]" />,
-        match: (p) => p === '/admin/studios' || p.startsWith('/admin/studios/'),
+        match: (p) => p === '/admin' || p.startsWith('/admin/studios'),
+      },
+      {
+        href: '/admin/payments',
+        label: 'Payments',
+        icon: <CreditCard className="h-[18px] w-[18px]" />,
+        match: (p) => p.startsWith('/admin/payments'),
+      },
+      {
+        href: '/admin/llm-monitoring',
+        label: 'LLM Monitor',
+        icon: <BarChart2 className="h-[18px] w-[18px]" />,
+        match: (p) => p.startsWith('/admin/llm-monitoring'),
+      },
+      {
+        href: '/admin/settings',
+        label: 'Settings',
+        icon: <Settings className="h-[18px] w-[18px]" />,
+        match: (p) => p.startsWith('/admin/settings'),
       },
     ];
   }
+
+  // Studio admin nav
   const sid = me.studioId!;
   const base = `/admin/studios/${sid}`;
-  return [
+  const links: NavItem[] = [
     { href: base,                 label: 'Dashboard', icon: <Home className="h-[18px] w-[18px]" />,           match: (p) => p === base },
     { href: `${base}/inbox`,      label: 'Inbox',     icon: <MessagesSquare className="h-[18px] w-[18px]" />, match: (p) => p.startsWith(`${base}/inbox`) },
-    { href: `${base}/pipeline`,   label: 'Pipeline',  icon: <KanbanSquare className="h-[18px] w-[18px]" />,   match: (p) => p.startsWith(`${base}/pipeline`) },
+    { href: `${base}/pipeline`,   label: 'Pipeline',  icon: <GitBranch className="h-[18px] w-[18px]" />,   match: (p) => p.startsWith(`${base}/pipeline`) },
     { href: `${base}/campaigns`,  label: 'Campaigns', icon: <Megaphone className="h-[18px] w-[18px]" />,      match: (p) => p.startsWith(`${base}/campaigns`) },
     { href: `${base}/leads`,      label: 'Leads',     icon: <Inbox className="h-[18px] w-[18px]" />,          match: (p) => p.startsWith(`${base}/leads`) },
-    { href: `${base}/channels`,   label: 'Channels',  icon: <Plug className="h-[18px] w-[18px]" />,           match: (p) => p.startsWith(`${base}/channels`) },
-    { href: `${base}/settings`,   label: 'Settings',  icon: <Settings className="h-[18px] w-[18px]" />,       match: (p) => p.startsWith(`${base}/settings`) },
   ];
+
+  if (me.studio?.socialPlannerEnabled) {
+    links.push({ href: `${base}/social-planner`, label: 'Social Planner', icon: <Sparkles className="h-[18px] w-[18px]" />, match: (p) => p.startsWith(`${base}/social-planner`) });
+  }
+
+  links.push(
+    { href: `${base}/payments`,   label: 'Payments',  icon: <CreditCard className="h-[18px] w-[18px]" />,     match: (p) => p.startsWith(`${base}/payments`) },
+    { href: `${base}/channels`,   label: 'Channels',  icon: <Plug className="h-[18px] w-[18px]" />,           match: (p) => p.startsWith(`${base}/channels`) },
+    { href: `${base}/knowledge-base`,  label: 'Knowledge Base', icon: <Database className="h-[18px] w-[18px]" />,  match: (p) => p.startsWith(`${base}/knowledge-base`) },
+    { href: `${base}/decision-trees`, label: 'Decision Trees', icon: <Network className="h-[18px] w-[18px]" />,  match: (p) => p.startsWith(`${base}/decision-trees`) },
+    { href: `${base}/settings`,       label: 'Settings',       icon: <Settings className="h-[18px] w-[18px]" />, match: (p) => p.startsWith(`${base}/settings`) },
+  );
+
+  return links;
 }
 
 export function AppShell({ me, children }: { me: Me; children: ReactNode }) {
@@ -62,6 +130,61 @@ export function AppShell({ me, children }: { me: Me; children: ReactNode }) {
   // All hooks must run unconditionally — keep them above the lockout branch.
   const pathname = usePathname();
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [isCollapsed, setIsCollapsed] = useState(false);
+  const [globalToast, setGlobalToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+
+  const checkToast = () => {
+    const raw = sessionStorage.getItem('studiox_toast');
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        setGlobalToast(parsed);
+        sessionStorage.removeItem('studiox_toast');
+      } catch (e) {
+        console.error(e);
+      }
+    }
+  };
+
+  useEffect(() => {
+    checkToast();
+  }, [pathname]);
+
+  useEffect(() => {
+    window.addEventListener('studiox_toast_update', checkToast);
+    return () => {
+      window.removeEventListener('studiox_toast_update', checkToast);
+    };
+  }, []);
+
+  const mainRef = useRef<HTMLDivElement>(null);
+  const [scrolled, setScrolled] = useState(false);
+
+  const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    setScrolled(e.currentTarget.scrollTop > 90);
+  };
+
+  useEffect(() => {
+    setScrolled(false);
+    if (mainRef.current) {
+      mainRef.current.scrollTop = 0;
+    }
+  }, [pathname]);
+
+  useEffect(() => {
+    const val = localStorage.getItem('sidebar-collapsed');
+    if (val !== null) {
+      setIsCollapsed(val === 'true');
+    }
+  }, []);
+
+  const handleToggleSidebar = () => {
+    setIsCollapsed(prev => {
+      const next = !prev;
+      localStorage.setItem('sidebar-collapsed', String(next));
+      return next;
+    });
+  };
 
   // Auto-close the drawer on navigation.
   useEffect(() => {
@@ -92,11 +215,16 @@ export function AppShell({ me, children }: { me: Me; children: ReactNode }) {
     return <StudioInactiveScreen me={me} />;
   }
 
+  // If the studio's payment is past due or canceled, block access to everything except settings.
+  const isPastDueOrCanceled = isStudio && (me.studio!.subscriptionTier === 'past_due' || me.studio!.subscriptionTier === 'canceled');
+  const showPastDueModal = isPastDueOrCanceled && !pathname.endsWith('/settings');
+
   return (
     <div
       className="min-h-screen text-zinc-900 dark:text-zinc-100"
       style={themeStyle}
     >
+      {showPastDueModal && <StudioPastDueModal me={me} />}
       {/* Mobile backdrop */}
       <div
         className={cn(
@@ -107,42 +235,96 @@ export function AppShell({ me, children }: { me: Me; children: ReactNode }) {
         aria-hidden
       />
 
-      <div className="lg:flex lg:h-screen lg:gap-4 lg:p-4">
-        <Sidebar me={me} mobileOpen={mobileOpen} onClose={() => setMobileOpen(false)} />
-        <div className="flex min-w-0 flex-1 flex-col overflow-hidden lg:glass-container">
-          <Topbar me={me} onMenuClick={() => setMobileOpen(true)} />
-          <main className="relative flex-1 overflow-y-auto px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
+      <div className="lg:flex lg:h-screen lg:gap-0 lg:p-0">
+        <Sidebar
+          me={me}
+          pathname={pathname}
+          mobileOpen={mobileOpen}
+          onClose={() => setMobileOpen(false)}
+          isCollapsed={isCollapsed}
+          onToggle={handleToggleSidebar}
+        />
+        <div className="flex min-w-0 flex-1 flex-col overflow-hidden bg-white dark:bg-zinc-950">
+          <Topbar me={me} scrolled={scrolled} onMenuClick={() => setMobileOpen(true)} />
+          <main
+            ref={mainRef}
+            onScroll={handleScroll}
+            className={cn(
+              "relative flex-1 overflow-y-auto",
+              pathname.includes('/inbox') ? "p-0 overflow-hidden" : "px-4 py-6 sm:px-6 lg:px-8 lg:py-8"
+            )}
+          >
             {children}
           </main>
         </div>
       </div>
+
+      {/* Custom Floating Toast Notification */}
+      {globalToast && (
+        <div className="fixed bottom-6 right-6 z-[9999] p-4 rounded-2xl border border-emerald-500/30 bg-white/90 dark:bg-zinc-900/90 backdrop-blur-xl shadow-2xl flex items-center gap-3 animate-in slide-in-from-bottom-5 fade-in duration-300 min-w-[320px]">
+          <div className={`h-8 w-8 rounded-xl flex items-center justify-center shrink-0 ${
+            globalToast.type === 'success' ? 'bg-emerald-500/10 text-emerald-500' : 'bg-red-500/10 text-red-500'
+          }`}>
+            {globalToast.type === 'success' ? (
+              <CheckCircle2 className="w-5 h-5" />
+            ) : (
+              <AlertCircle className="w-5 h-5" />
+            )}
+          </div>
+          <div className="flex-1">
+            <p className="text-xs font-black uppercase tracking-wider text-zinc-800 dark:text-zinc-100">
+              {globalToast.type === 'success' ? 'Success' : 'Error'}
+            </p>
+            <p className="text-[10px] text-zinc-500 dark:text-zinc-400 font-semibold mt-0.5">{globalToast.message}</p>
+          </div>
+          <button 
+            onClick={() => setGlobalToast(null)} 
+            className="text-zinc-400 hover:text-zinc-600 dark:hover:text-white p-1 rounded-lg transition-colors"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
     </div>
   );
 }
 
 function Sidebar({
   me,
+  pathname,
   mobileOpen,
   onClose,
+  isCollapsed,
+  onToggle,
 }: {
   me: Me;
+  pathname: string;
   mobileOpen: boolean;
   onClose: () => void;
+  isCollapsed: boolean;
+  onToggle: () => void;
 }) {
-  const pathname = usePathname();
-  const items = navItemsFor(me);
+  const items = navItemsFor(me, pathname);
   const isStudio = me.role === 'studio_admin' && !!me.studio;
   const studio = isStudio ? me.studio! : null;
+  const isSuperAdminInStudio = me.role === 'super_admin' && /\/admin\/studios\/[^/]+/.test(pathname);
+
+  const [logoError, setLogoError] = useState(false);
+  useEffect(() => {
+    setLogoError(false);
+  }, [studio?.logoUrl]);
 
   return (
     <aside
       className={cn(
         // Mobile: fixed drawer that slides in from the left
-        'fixed inset-y-4 left-4 z-50 flex w-72 flex-col overflow-hidden rounded-[32px] border border-white/40 bg-white/40 px-4 py-6 backdrop-blur-3xl transition-all duration-500 ease-[cubic-bezier(0.34,1.56,0.64,1)]',
-        'dark:border-white/10 dark:bg-neutral-900/40',
+        'fixed inset-y-0 left-0 z-50 flex w-72 flex-col overflow-hidden border-r border-zinc-200 bg-white px-4 py-6 transition-all duration-300 dark:border-zinc-800 dark:bg-zinc-950',
         // Desktop: sticky in flow, always visible
-        'lg:relative lg:inset-y-0 lg:left-0 lg:z-auto lg:h-full lg:w-20 lg:translate-x-0 lg:items-center lg:rounded-[40px] lg:px-2 lg:shadow-liquid lg:transition-[width,padding] lg:duration-300 lg:ease-out hover:lg:w-64 hover:lg:px-3 group/sidebar',
-        mobileOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-[calc(100%+20px)]',
+        'lg:relative lg:inset-y-0 lg:left-0 lg:z-auto lg:h-full lg:translate-x-0 lg:border-r lg:border-zinc-200 lg:bg-[#f8f9fa] lg:dark:bg-zinc-900 lg:dark:border-zinc-800 lg:shadow-none lg:rounded-none lg:transition-[width,padding] lg:duration-300 lg:ease-out',
+        isCollapsed 
+          ? 'lg:w-20 lg:items-center lg:px-2' 
+          : 'lg:w-64 lg:items-stretch lg:px-4',
+        mobileOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-full',
       )}
       aria-label="Primary navigation"
     >
@@ -159,19 +341,25 @@ function Sidebar({
 
       {/* Brand block */}
       {isStudio ? (
-        <div className="mb-10 flex animate-in items-center gap-3 lg:flex-col lg:gap-1 lg:transition-all lg:duration-300 group-hover/sidebar:lg:flex-row group-hover/sidebar:lg:gap-3" style={{ animationDelay: '100ms' }}>
+        <div className={cn(
+          "mb-4 lg:mb-6 flex items-center gap-3 lg:transition-all lg:duration-300 shrink-0",
+          isCollapsed ? "lg:flex-col lg:gap-1" : "lg:flex-row lg:gap-3"
+        )}>
           <div
-            className="grid h-12 w-12 shrink-0 animate-float place-items-center overflow-hidden rounded-2xl text-sm font-bold text-white shadow-lg shadow-brand-500/20 ring-4 ring-white/30"
+            className="grid h-10 w-10 shrink-0 place-items-center overflow-hidden rounded text-sm font-bold text-white shadow-sm"
             style={{ background: studio!.brandColor }}
           >
-            {studio!.logoUrl ? (
+            {studio!.logoUrl && !logoError ? (
               // eslint-disable-next-line @next/next/no-img-element
-              <img src={studio!.logoUrl} alt="" className="h-12 w-12 object-cover" />
+              <img src={studio!.logoUrl} alt="" className="h-10 w-10 object-cover" onError={() => setLogoError(true)} />
             ) : (
               brandInitials(studio!.name)
             )}
           </div>
-          <div className="min-w-0 lg:block lg:max-w-0 lg:overflow-hidden lg:opacity-0 lg:transition-all lg:duration-300 group-hover/sidebar:lg:max-w-[11rem] group-hover/sidebar:lg:opacity-100">
+          <div className={cn(
+            "min-w-0 lg:block lg:transition-all lg:duration-300",
+            isCollapsed ? "lg:max-w-0 lg:overflow-hidden lg:opacity-0" : "lg:max-w-[11rem] lg:opacity-100"
+          )}>
             <div className="truncate text-sm font-bold text-zinc-900 dark:text-zinc-100">
               {studio!.name}
             </div>
@@ -181,11 +369,15 @@ function Sidebar({
           </div>
         </div>
       ) : (
-        <div className="mb-10 flex animate-in items-center gap-3 lg:flex-col lg:gap-1 lg:transition-all lg:duration-300 group-hover/sidebar:lg:flex-row group-hover/sidebar:lg:gap-3" style={{ animationDelay: '100ms' }}>
-          <div className="grid h-12 w-12 shrink-0 animate-float place-items-center rounded-2xl bg-gradient-to-br from-brand-300 via-brand-primary to-brand-700 text-sm font-extrabold text-white shadow-lg shadow-brand-500/20 ring-4 ring-white/30">
-            1H
-          </div>
-          <div className="min-w-0 lg:block lg:max-w-0 lg:overflow-hidden lg:opacity-0 lg:transition-all lg:duration-300 group-hover/sidebar:lg:max-w-[11rem] group-hover/sidebar:lg:opacity-100">
+        <div className={cn(
+          "mb-4 lg:mb-6 flex items-center gap-3 lg:transition-all lg:duration-300 shrink-0",
+          isCollapsed ? "lg:flex-col lg:gap-1" : "lg:flex-row lg:gap-3"
+        )}>
+          <img src="/logo.png" alt="1herosocial.ai Logo" className="h-10 w-10 shrink-0 object-contain rounded shadow-sm" />
+          <div className={cn(
+            "min-w-0 lg:block lg:transition-all lg:duration-300",
+            isCollapsed ? "lg:max-w-0 lg:overflow-hidden lg:opacity-0" : "lg:max-w-[11rem] lg:opacity-100"
+          )}>
             <div className="truncate text-sm font-bold text-zinc-900 dark:text-zinc-100">
               1herosocial.ai
             </div>
@@ -195,7 +387,27 @@ function Sidebar({
       )}
 
       {/* Nav */}
-      <nav className="flex flex-1 flex-col gap-3 overflow-y-auto lg:w-full lg:items-center group-hover/sidebar:lg:items-stretch">
+      <nav className={cn(
+        "flex flex-1 flex-col gap-1 overflow-y-auto lg:w-full",
+        "scrollbar-thin scrollbar-thumb-zinc-200 scrollbar-track-transparent dark:scrollbar-thumb-zinc-700",
+        isCollapsed ? "lg:items-center" : "lg:items-stretch"
+      )}>
+        {isSuperAdminInStudio && (
+          <Link
+            href="/admin/studios"
+            className={cn(
+              'group flex animate-in items-center gap-2 rounded px-3 py-2 text-xs font-semibold text-zinc-400 transition-colors hover:bg-zinc-105 hover:text-zinc-700 dark:text-zinc-500 dark:hover:bg-zinc-800 dark:hover:text-zinc-300 mb-1',
+              isCollapsed ? 'lg:justify-center' : 'lg:justify-start',
+            )}
+            title="All Studios"
+          >
+            <ChevronLeft className="h-4 w-4 shrink-0 transition-transform group-hover:-translate-x-0.5" />
+            <span className={cn(
+              'lg:transition-all lg:duration-300',
+              isCollapsed ? 'lg:max-w-0 lg:overflow-hidden lg:opacity-0' : 'lg:max-w-[10rem] lg:opacity-100'
+            )}>All Studios</span>
+          </Link>
+        )}
         {items.map((item, idx) => {
           const active = item.match ? item.match(pathname) : pathname === item.href;
           return (
@@ -203,21 +415,24 @@ function Sidebar({
               key={item.href}
               href={item.href}
               className={cn(
-                'group flex animate-in items-center gap-3 rounded-[20px] px-3 py-3 text-sm font-semibold transition-colors duration-300 lg:transition-[background-color,color,box-shadow,padding,transform] lg:duration-300',
+                'group flex animate-in items-center gap-3 rounded px-3 py-2 text-sm font-semibold transition-colors duration-200',
                 active
-                  ? 'text-white shadow-lg'
-                  : 'text-zinc-500 hover:bg-white/50 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/5 dark:hover:text-zinc-100',
-                'lg:justify-center group-hover/sidebar:lg:justify-start',
+                  ? 'text-white'
+                  : 'text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100',
+                isCollapsed ? 'lg:justify-center' : 'lg:justify-start',
               )}
               style={{
                 animationDelay: `${150 + idx * 50}ms`,
-                ...(active ? { background: 'linear-gradient(135deg, var(--brand) 0%, #a78bfa 100%)', boxShadow: '0 8px 16px -4px rgba(124, 58, 237, 0.3)' } : {}),
+                ...(active ? { background: 'var(--brand)' } : {}),
               }}
             >
               <span className={cn('shrink-0 transition-transform duration-300 group-hover:scale-110', active && '[&>svg]:stroke-[2.5]')}>
                 {item.icon}
               </span>
-              <span className="truncate lg:block lg:max-w-0 lg:overflow-hidden lg:opacity-0 lg:transition-all lg:duration-300 group-hover/sidebar:lg:max-w-[12rem] group-hover/sidebar:lg:opacity-100">
+              <span className={cn(
+                "truncate lg:block lg:transition-all lg:duration-300",
+                isCollapsed ? "lg:max-w-0 lg:overflow-hidden lg:opacity-0" : "lg:max-w-[12rem] lg:opacity-100"
+              )}>
                 {item.label}
               </span>
             </Link>
@@ -225,23 +440,71 @@ function Sidebar({
         })}
       </nav>
 
-      {/* Footer hint */}
-      <div className="mt-6 animate-in rounded-3xl border border-white/20 bg-white/20 p-4 text-xs text-zinc-500 backdrop-blur-md dark:border-white/5 dark:bg-black/20 lg:block lg:max-h-0 lg:overflow-hidden lg:p-0 lg:opacity-0 lg:transition-all lg:duration-300 group-hover/sidebar:lg:max-h-40 group-hover/sidebar:lg:p-4 group-hover/sidebar:lg:opacity-100" style={{ animationDelay: '500ms' }}>
-        <div className="flex items-center gap-2 font-black text-zinc-800 dark:text-zinc-200">
-          <Sparkles className="h-3.5 w-3.5 text-brand-500" />
-          Tip
-        </div>
-        <p className="mt-1.5 leading-relaxed font-medium">
-          {isStudio
-            ? 'Drop your campaign link in your Instagram bio to start collecting leads.'
-            : 'Studios sign in at the same /login URL — their account routes them to their own dashboard.'}
-        </p>
+      {/* Sidebar Footer Controls */}
+      <div className="mt-auto hidden lg:flex items-center justify-center w-full pt-4 border-t border-zinc-200 dark:border-zinc-800 shrink-0">
+        <button
+          type="button"
+          onClick={onToggle}
+          className="flex h-8 w-8 items-center justify-center rounded border border-zinc-200 bg-white hover:bg-zinc-100 dark:bg-zinc-900 dark:hover:bg-zinc-800 dark:border-zinc-800 text-zinc-500 hover:text-zinc-800 dark:hover:text-white transition-colors"
+          title={isCollapsed ? "Expand" : "Collapse"}
+        >
+          {isCollapsed ? (
+            <ChevronRight className="h-4 w-4" />
+          ) : (
+            <ChevronLeft className="h-4 w-4" />
+          )}
+        </button>
       </div>
     </aside>
   );
 }
 
-function Topbar({ me, onMenuClick }: { me: Me; onMenuClick: () => void }) {
+function ThemeToggle() {
+  const [theme, setTheme] = useState<'light' | 'dark'>('light');
+
+  useEffect(() => {
+    const isDark = document.documentElement.classList.contains('dark');
+    setTheme(isDark ? 'dark' : 'light');
+  }, []);
+
+  const toggleTheme = () => {
+    const nextTheme = theme === 'light' ? 'dark' : 'light';
+    setTheme(nextTheme);
+    if (nextTheme === 'dark') {
+      document.documentElement.classList.add('dark');
+      localStorage.setItem('theme', 'dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+      localStorage.setItem('theme', 'light');
+    }
+  };
+
+  return (
+    <button
+      onClick={toggleTheme}
+      className="grid h-8 w-8 place-items-center rounded border border-zinc-200 bg-white dark:bg-zinc-900 dark:border-zinc-800 text-zinc-500 hover:text-zinc-850 dark:text-zinc-400 dark:hover:text-white transition-all duration-305 shadow-sm shrink-0"
+      aria-label="Toggle theme"
+      title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
+    >
+      {theme === 'light' ? (
+        <Moon className="h-4 w-4" />
+      ) : (
+        <Sun className="h-4 w-4" />
+      )}
+    </button>
+  );
+}
+
+function Topbar({
+  me,
+  scrolled,
+  onMenuClick,
+}: {
+  me: Me;
+  scrolled: boolean;
+  onMenuClick: () => void;
+}) {
+  const pathname = usePathname();
   const router = useRouter();
   const [open, setOpen] = useState(false);
 
@@ -254,67 +517,164 @@ function Topbar({ me, onMenuClick }: { me: Me; onMenuClick: () => void }) {
     }
   }
 
+  // Determine page title & indicators dynamically based on route path
+  let pageTitle = '';
+  let pageIcon = null;
+  let pageSubtitle = null;
+
+  if (pathname.includes('/inbox')) {
+    pageTitle = 'Inbox';
+    pageIcon = <MessagesSquare className="h-[18px] w-[18px] text-blue-600 dark:text-blue-400" />;
+    pageSubtitle = (
+      <div className="hidden items-center gap-2 sm:flex">
+        <div className="flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-[10px] font-black uppercase tracking-wider text-emerald-600 dark:text-emerald-400">
+          <span className="relative flex h-1.5 w-1.5">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+            <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-500" />
+          </span>
+          Live
+        </div>
+        <div className="flex items-center gap-1.5 rounded-full bg-violet-500/10 px-2.5 py-1 text-[10px] font-black uppercase tracking-wider text-violet-600 dark:text-violet-400">
+          <Zap className="h-3 w-3" />
+          Stream
+        </div>
+      </div>
+    );
+  } else if (pathname.includes('/pipeline')) {
+    pageTitle = 'Pipeline';
+    pageIcon = <GitBranch className="h-[18px] w-[18px] text-violet-600 dark:text-violet-400" />;
+  } else if (pathname.includes('/campaigns/new')) {
+    pageTitle = 'Create Campaign';
+    pageIcon = <Megaphone className="h-[18px] w-[18px] text-pink-550 dark:text-pink-400" />;
+  } else if (pathname.includes('/campaigns/')) {
+    pageTitle = 'Campaign Details';
+    pageIcon = <Megaphone className="h-[18px] w-[18px] text-pink-550 dark:text-pink-400" />;
+  } else if (pathname.includes('/campaigns')) {
+    pageTitle = 'Campaigns';
+    pageIcon = <Megaphone className="h-[18px] w-[18px] text-pink-550 dark:text-pink-400" />;
+  } else if (pathname.includes('/leads')) {
+    pageTitle = 'Leads';
+    pageIcon = <Inbox className="h-[18px] w-[18px] text-emerald-500" />;
+  } else if (pathname.includes('/social-planner')) {
+    pageTitle = 'Social Planner';
+    pageIcon = <Sparkles className="h-[18px] w-[18px] text-amber-500" />;
+  } else if (pathname.includes('/payments')) {
+    pageTitle = 'Payments';
+    pageIcon = <CreditCard className="h-[18px] w-[18px] text-violet-500" />;
+  } else if (pathname.includes('/channels')) {
+    pageTitle = 'Channels';
+    pageIcon = <Plug className="h-[18px] w-[18px] text-teal-500" />;
+  } else if (pathname.includes('/knowledge-base')) {
+    pageTitle = 'Knowledge Base';
+    pageIcon = <Database className="h-[18px] w-[18px] text-indigo-500" />;
+  } else if (pathname.includes('/decision-trees')) {
+    pageTitle = 'Decision Trees';
+    pageIcon = <Network className="h-[18px] w-[18px] text-violet-500" />;
+  } else if (pathname.includes('/llm-monitoring')) {
+    pageTitle = 'LLM Monitor';
+    pageIcon = <BarChart2 className="h-[18px] w-[18px] text-violet-500" />;
+  } else if (pathname.includes('/settings')) {
+    pageTitle = 'Settings';
+    pageIcon = <Settings className="h-[18px] w-[18px] text-slate-500" />;
+  } else if (pathname === '/admin/studios' || pathname === '/admin') {
+    pageTitle = 'Studios';
+    pageIcon = <Building2 className="h-[18px] w-[18px] text-brand-500" style={{ color: `var(--brand)` }} />;
+  } else {
+    pageTitle = 'Dashboard';
+    pageIcon = <Home className="h-[18px] w-[18px] text-slate-600 dark:text-slate-400" />;
+  }
   return (
-    <header className="sticky top-0 z-20 flex h-16 items-center justify-between gap-3 border-b border-white/10 bg-white/40 px-4 backdrop-blur-xl sm:px-6 lg:justify-end lg:px-10 dark:bg-neutral-950/40">
+    <header className="sticky top-0 z-20 flex h-14 items-center justify-between gap-2 border-b border-zinc-200 bg-white px-3 sm:px-6 dark:border-zinc-800 dark:bg-zinc-950 shrink-0">
       {/* Mobile menu button */}
       <button
         type="button"
         onClick={onMenuClick}
-        className="grid h-10 w-10 place-items-center rounded-xl text-slate-700 hover:bg-slate-100 lg:hidden dark:text-slate-200 dark:hover:bg-slate-800"
+        className="grid h-8 w-8 place-items-center rounded text-slate-700 hover:bg-slate-100 lg:hidden dark:text-slate-200 dark:hover:bg-slate-800 shrink-0"
         aria-label="Open menu"
         suppressHydrationWarning
       >
         <Menu className="h-5 w-5" />
       </button>
 
-      <div className="relative">
-        <button
-          onClick={() => setOpen(!open)}
-          className="flex items-center gap-3 rounded-2xl p-1 pr-3 transition-all duration-300 hover:bg-slate-100 dark:hover:bg-slate-800"
-          suppressHydrationWarning
-        >
-          <div className="grid h-9 w-9 place-items-center rounded-xl bg-gradient-to-br from-brand-400 to-brand-600 text-sm font-bold text-white shadow-lg ring-2 ring-white dark:ring-slate-900">
-            {(me.email[0] ?? '').toUpperCase()}
+      {/* Dynamic Page Header Title & Status Badges */}
+      <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+        {pageIcon && (
+          <div className="hidden h-8 w-8 items-center justify-center rounded border border-zinc-200 bg-zinc-50 dark:bg-zinc-900 dark:border-zinc-800 sm:flex">
+            {pageIcon}
           </div>
-          <div className="hidden flex-col items-start sm:flex">
-            <span className="max-w-[150px] truncate text-sm font-bold text-slate-900 dark:text-slate-100">
-              {me.email.split('@')[0]}
-            </span>
-            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
-              {me.role.replace('_', ' ')}
-            </span>
-          </div>
-          <Menu className={cn("h-4 w-4 text-slate-400 transition-transform duration-300", open && "rotate-90")} />
-        </button>
+        )}
+        {pageTitle && (
+          <h1 className="text-sm sm:text-base font-black tracking-tight text-zinc-900 dark:text-white whitespace-nowrap">
+            {pageTitle}
+          </h1>
+        )}
+        {pageSubtitle}
+      </div>
 
-        {open && (
-          <>
-            <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
-            <div className="absolute right-0 top-full mt-3 w-64 animate-in overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-2xl backdrop-blur-xl dark:border-slate-800 dark:bg-slate-900/90 z-20">
-              <div className="border-b border-slate-100 p-5 dark:border-slate-800/60">
-                <div className="flex items-center gap-3">
-                  <div className="grid h-12 w-12 place-items-center rounded-2xl bg-brand-500 text-lg font-bold text-white">
-                    {(me.email[0] ?? '').toUpperCase()}
-                  </div>
-                  <div className="min-w-0">
-                    <div className="truncate text-base font-bold text-slate-900 dark:text-slate-100">{me.email.split('@')[0]}</div>
-                    <div className="truncate text-xs text-slate-500">{me.email}</div>
+      {/* Spacer to push controls to the right */}
+      <div className="mr-auto" />
+
+      <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+        {/* Dynamic Page Header Actions Portal */}
+        <div id="topbar-actions" className="flex items-center gap-2.5 empty:hidden [&_select]:max-w-[38vw] [&_select]:sm:max-w-none [&_select]:truncate" />
+
+        {/* Theme Toggle Button */}
+        <ThemeToggle />
+
+        <div className="relative">
+          <button
+            onClick={() => setOpen(!open)}
+            className="flex items-center gap-3 rounded p-1 pr-3 transition-all duration-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+            suppressHydrationWarning
+          >
+            <div 
+              className="grid h-8 w-8 place-items-center rounded text-sm font-extrabold text-white"
+              style={{
+                background: `var(--brand, #7c3aed)`,
+              }}
+            >
+              {(me.email[0] ?? '').toUpperCase()}
+            </div>
+            <div className="hidden flex-col items-start sm:flex">
+              <span className="max-w-[150px] truncate text-xs font-bold text-slate-900 dark:text-slate-100">
+                {me.email.split('@')[0]}
+              </span>
+              <span className="text-[9px] font-bold uppercase tracking-wider text-slate-505">
+                {me.role.replace('_', ' ')}
+              </span>
+            </div>
+            <Menu className={cn("h-4 w-4 text-slate-400 transition-transform duration-300", open && "rotate-90")} />
+          </button>
+
+          {open && (
+            <>
+              <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
+              <div className="absolute right-0 top-full mt-2 w-64 animate-in overflow-hidden rounded border border-zinc-200 bg-white shadow-lg dark:border-zinc-800 dark:bg-zinc-900 z-20">
+                <div className="border-b border-zinc-200 p-4 dark:border-zinc-800">
+                  <div className="flex items-center gap-3">
+                    <div className="grid h-10 w-10 place-items-center rounded bg-brand-500 text-base font-bold text-white">
+                      {(me.email[0] ?? '').toUpperCase()}
+                    </div>
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-bold text-slate-900 dark:text-slate-100">{me.email.split('@')[0]}</div>
+                      <div className="truncate text-xs text-slate-500">{me.email}</div>
+                    </div>
                   </div>
                 </div>
+                <div className="p-1">
+                  <button
+                    onClick={logout}
+                    className="flex w-full items-center gap-3 rounded px-4 py-2.5 text-xs font-bold text-red-600 transition-colors hover:bg-red-50 dark:hover:bg-red-500/10"
+                    suppressHydrationWarning
+                  >
+                    <LogOut className="h-4 w-4" />
+                    Sign out
+                  </button>
+                </div>
               </div>
-              <div className="p-2">
-                <button
-                  onClick={logout}
-                  className="flex w-full items-center gap-3 rounded-xl px-4 py-3 text-sm font-bold text-red-600 transition-colors hover:bg-red-50 dark:hover:bg-red-500/10"
-                  suppressHydrationWarning
-                >
-                  <LogOut className="h-4 w-4" />
-                  Sign out
-                </button>
-              </div>
-            </div>
-          </>
-        )}
+            </>
+          )}
+        </div>
       </div>
     </header>
   );
@@ -357,5 +717,34 @@ function StudioInactiveScreen({ me }: { me: Me }) {
         </div>
       </div>
     </main>
+  );
+}
+
+function StudioPastDueModal({ me }: { me: Me }) {
+  const router = useRouter();
+  const studio = me.studio!;
+
+  return (
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-slate-900/60 backdrop-blur-md p-4 animate-in fade-in duration-300">
+      <div className="w-full max-w-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-[28px] shadow-2xl p-8 text-center animate-in zoom-in-95 duration-300">
+        <div className="mx-auto mb-6 grid h-16 w-16 place-items-center rounded-2xl bg-red-50 dark:bg-red-500/10 text-red-600 dark:text-red-500 shadow-inner">
+          <CreditCard className="h-8 w-8" />
+        </div>
+        <h2 className="text-2xl font-black tracking-tight text-slate-900 dark:text-white mb-3">
+          Subscription Paused
+        </h2>
+        <p className="text-sm text-slate-600 dark:text-slate-400 leading-relaxed mb-8">
+          Your studio's subscription is either past due or canceled. Please update your billing details or select a new plan to restore access to the platform.
+        </p>
+        <div className="mt-8 flex justify-center gap-4">
+          <Button 
+            className="w-full h-12 text-sm font-bold shadow-lg"
+            onClick={() => router.push(`/admin/studios/${me.studioId}/settings`)}
+          >
+            Manage Billing & Plans
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }

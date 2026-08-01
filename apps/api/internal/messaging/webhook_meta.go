@@ -6,7 +6,6 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -19,8 +18,8 @@ import (
 
 // MetaWebhookHandler exposes:
 //
-//   GET  /api/v1/webhooks/meta/whatsapp   — Meta verification handshake
-//   POST /api/v1/webhooks/meta/whatsapp   — inbound events (messages, statuses)
+//	GET  /api/v1/webhooks/meta/whatsapp   — Meta verification handshake
+//	POST /api/v1/webhooks/meta/whatsapp   — inbound events (messages, statuses)
 //
 // Both endpoints are single, app-level (one Meta App = one webhook URL = many
 // connected studios). Studio-level routing happens via the phone_number_id in
@@ -59,11 +58,49 @@ func (h *MetaWebhookHandler) Verify(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(challenge))
 }
 
+// HandleDataDeletion processes Meta's data deletion requests (GDPR/privacy compliance)
+func (h *MetaWebhookHandler) HandleDataDeletion(w http.ResponseWriter, r *http.Request) {
+	log := logger.FromCtx(r.Context(), h.log).With("webhook", "meta_data_deletion")
+
+	var req struct {
+		SignedRequest string `json:"signed_request"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Error("decode request", "err", err)
+		httpx.JSON(w, http.StatusOK, map[string]string{"url": ""})
+		return
+	}
+
+	if req.SignedRequest == "" {
+		log.Warn("no signed request provided")
+		httpx.JSON(w, http.StatusOK, map[string]string{"url": ""})
+		return
+	}
+
+	// Parse the signed request (format: base64_signature.base64_payload)
+	parts := strings.Split(req.SignedRequest, ".")
+	if len(parts) != 2 {
+		log.Warn("invalid signed request format")
+		httpx.JSON(w, http.StatusOK, map[string]string{"url": ""})
+		return
+	}
+
+	// For now, we just acknowledge the deletion request
+	// In production, you would verify the signature using your app secret
+	// and then delete the user's data from your database
+
+	log.Info("data deletion request received", "request", req.SignedRequest)
+
+	// Return confirmation to Meta
+	httpx.JSON(w, http.StatusOK, map[string]string{
+		"url": "https://1herosocial.ai/privacy",
+	})
+}
+
 // POST handler: receive WhatsApp events. Verify HMAC, parse, dispatch to service.
 // We always 200 to Meta even on internal errors so they don't retry forever
 // (errors are logged on our side).
 func (h *MetaWebhookHandler) Receive(w http.ResponseWriter, r *http.Request) {
-	fmt.Printf("DEBUG: MetaWebhookHandler.Receive received POST request\n")
 	log := logger.FromCtx(r.Context(), h.log).With("webhook", "meta_messaging")
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, 5<<20)) // 5 MB cap
@@ -73,16 +110,61 @@ func (h *MetaWebhookHandler) Receive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.verifySignature(r.Header.Get("X-Hub-Signature-256"), body) {
-		log.Warn("invalid signature on meta webhook — rejecting")
-		http.Error(w, "bad signature", http.StatusUnauthorized)
-		return
+	var payload channels.MetaWebhookPayload
+	_ = json.Unmarshal(body, &payload) // unmarshal first to check for custom secret
+
+	// Try to find the external ID of the channel from the webhook entries.
+	var externalID string
+	var kind ChannelKind = KindWhatsAppMeta
+
+	for _, entry := range payload.Entry {
+		if payload.Object == "whatsapp_business_account" {
+			kind = KindWhatsAppMeta
+			for _, change := range entry.Changes {
+				if change.Field == "messages" {
+					externalID = change.Value.Metadata.PhoneNumberID
+					break
+				}
+			}
+			if externalID == "" {
+				externalID = entry.ID
+			}
+		} else if payload.Object == "instagram" || payload.Object == "page" {
+			if payload.Object == "page" {
+				kind = KindMessengerMeta
+			} else {
+				kind = KindInstagramMeta
+			}
+			for _, m := range entry.Messaging {
+				if m.Recipient.ID != "" {
+					externalID = m.Recipient.ID
+					break
+				}
+				if m.Sender.ID != "" {
+					externalID = m.Sender.ID
+					break
+				}
+			}
+		}
+		if externalID != "" {
+			break
+		}
 	}
 
-	var payload channels.MetaWebhookPayload
-	if err := json.Unmarshal(body, &payload); err != nil {
-		log.Error("decode payload", "err", err, "body", string(body))
-		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ignored"})
+	secretToUse := h.appSecret
+	if externalID != "" {
+		channel, err := h.svc.repo.GetChannelByExternalID(r.Context(), kind, externalID)
+		if err == nil && channel != nil {
+			customSecret, err := h.svc.repo.GetStudioMetaAppSecret(r.Context(), channel.StudioID)
+			if err == nil && customSecret != "" {
+				secretToUse = customSecret
+			}
+		}
+	}
+
+	if !h.verifySignature(r.Header.Get("X-Hub-Signature-256"), body, secretToUse) {
+		log.Warn("invalid signature on meta webhook — rejecting")
+		http.Error(w, "bad signature", http.StatusUnauthorized)
 		return
 	}
 
@@ -138,8 +220,8 @@ func (h *MetaWebhookHandler) Receive(w http.ResponseWriter, r *http.Request) {
 
 // verifySignature: Meta signs the raw body with HMAC-SHA256 using the App
 // Secret. Header format: "sha256=<hex>". Constant-time compare.
-func (h *MetaWebhookHandler) verifySignature(header string, body []byte) bool {
-	if h.appSecret == "" {
+func (h *MetaWebhookHandler) verifySignature(header string, body []byte, secret string) bool {
+	if secret == "" {
 		// Misconfiguration: refuse rather than silently accept.
 		return false
 	}
@@ -150,7 +232,7 @@ func (h *MetaWebhookHandler) verifySignature(header string, body []byte) bool {
 	if err != nil {
 		return false
 	}
-	mac := hmac.New(sha256.New, []byte(h.appSecret))
+	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)
 	expected := mac.Sum(nil)
 	return subtle.ConstantTimeCompare(provided, expected) == 1

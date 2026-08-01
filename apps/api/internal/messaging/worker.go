@@ -6,8 +6,10 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/projectx/api/internal/messaging/channels"
@@ -21,6 +23,9 @@ type OutboundWorker struct {
 	bus       Bus
 	whatsapp  channels.Sender
 	messenger channels.Sender
+	twilio    channels.Sender
+	x         channels.Sender
+	telegram  channels.Sender
 	log       *slog.Logger
 }
 
@@ -30,14 +35,27 @@ const (
 	maxAttempts        = 6
 )
 
-func NewOutboundWorker(repo *Repo, bus Bus, whatsapp, messenger channels.Sender, log *slog.Logger) *OutboundWorker {
-	return &OutboundWorker{repo: repo, bus: bus, whatsapp: whatsapp, messenger: messenger, log: log}
+func NewOutboundWorker(repo *Repo, bus Bus, whatsapp, messenger, twilio, x, telegram channels.Sender, log *slog.Logger) *OutboundWorker {
+	return &OutboundWorker{
+		repo:      repo,
+		bus:       bus,
+		whatsapp:  whatsapp,
+		messenger: messenger,
+		twilio:    twilio,
+		x:         x,
+		telegram:  telegram,
+		log:       log,
+	}
 }
 
 func (w *OutboundWorker) Run(ctx context.Context) {
 	w.log.Info("outbound worker started", "poll", workerPollInterval, "batch", workerBatchSize)
 	t := time.NewTicker(workerPollInterval)
 	defer t.Stop()
+
+	eventsCh, unsub := w.bus.Subscribe(uuid.Nil)
+	defer unsub()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -45,6 +63,13 @@ func (w *OutboundWorker) Run(ctx context.Context) {
 			return
 		case <-t.C:
 			w.tick(ctx)
+		case evt, ok := <-eventsCh:
+			if !ok {
+				return
+			}
+			if evt.Kind == EvtOutboundJobEnqueued {
+				w.tick(ctx)
+			}
 		}
 	}
 }
@@ -72,6 +97,44 @@ func (w *OutboundWorker) dispatch(ctx context.Context, j OutboundJob) {
 		w.failJob(ctx, j, "channel lookup: "+err.Error(), true) // dead — channel deleted
 		return
 	}
+
+	// Resolve template variables for the message body
+	var studioName string
+	err = w.repo.Pool().QueryRow(ctx, "SELECT name FROM studios WHERE id = $1", j.StudioID).Scan(&studioName)
+	if err != nil {
+		w.log.Error("failed to fetch studio name for template replacement", "err", err)
+	}
+
+	contactFirstName := ""
+	campaignName := ""
+	if conv.LeadID != nil {
+		err = w.repo.Pool().QueryRow(ctx, `
+			SELECT COALESCE(NULLIF(l.first_name, ''), SPLIT_PART(l.name, ' ', 1)), COALESCE(c.name, '')
+			FROM leads l
+			LEFT JOIN campaigns c ON l.campaign_id = c.id
+			WHERE l.id = $1
+		`, *conv.LeadID).Scan(&contactFirstName, &campaignName)
+		if err != nil {
+			w.log.Error("failed to fetch lead/campaign details for template replacement", "err", err)
+		}
+	}
+
+	if contactFirstName == "" {
+		if conv.ContactDisplayName != "" {
+			contactFirstName = strings.Split(conv.ContactDisplayName, " ")[0]
+		} else {
+			contactFirstName = "there"
+		}
+	}
+	// Sanity check: if the name still looks like a raw chat ID, fall back to "there"
+	if strings.Contains(contactFirstName, "@") {
+		contactFirstName = "there"
+	}
+
+	// Replace placeholders in the body
+	j.Body = strings.ReplaceAll(j.Body, "{{contact.first_name}}", contactFirstName)
+	j.Body = strings.ReplaceAll(j.Body, "{{studio.name}}", studioName)
+	j.Body = strings.ReplaceAll(j.Body, "{{campaign.name}}", campaignName)
 	// In local/dev mode, allow error status channels for testing.
 	isLocalDev := os.Getenv("API_ENV") == "local"
 	if channel.Status != StatusActive {
@@ -104,8 +167,19 @@ func (w *OutboundWorker) dispatch(ctx context.Context, j OutboundJob) {
 			sender = w.messenger
 		}
 	case KindSMS:
-		w.log.Info("SMS outbound job dispatched (mock)", "recipient", conv.ContactValue, "body", j.Body)
-		sender = &testSender{}
+		if isLocalDev && channel.AccessToken == "test:test" {
+			sender = &testSender{}
+		} else {
+			sender = w.twilio
+		}
+	case KindXDM:
+		sender = w.x
+	case KindTelegram:
+		sender = w.telegram
+	case KindWhatsAppWeb:
+		sender = &waWebSender{studioID: j.StudioID}
+	case KindTelegramMTProto:
+		sender = &tgWebSender{studioID: j.StudioID}
 	default:
 		w.failJob(ctx, j, "no sender for channel kind: "+string(channel.Kind), true)
 		return

@@ -21,13 +21,16 @@ const (
 	EvtMessageReceived     EventKind = "message.received" // inbound from customer
 	EvtMessageSent         EventKind = "message.sent"     // outbound delivered to channel
 	EvtConversationUpdated EventKind = "conversation.updated"
+	EvtOutboundJobEnqueued EventKind = "outbound_job.enqueued"
+	EvtWAWebBackfillDone   EventKind = "wa_web_backfill.done" // chat history import finished for a studio
 )
 
 type Event struct {
-	Kind           EventKind  `json:"kind"`
-	StudioID       uuid.UUID  `json:"studioId"`
-	ConversationID uuid.UUID  `json:"conversationId"`
-	MessageID      *uuid.UUID `json:"messageId,omitempty"`
+	Kind             EventKind  `json:"kind"`
+	StudioID         uuid.UUID  `json:"studioId"`
+	ConversationID   uuid.UUID  `json:"conversationId"`
+	MessageID        *uuid.UUID `json:"messageId,omitempty"`
+	ChannelAccountID *uuid.UUID `json:"channelAccountId,omitempty"` // set on EvtWAWebBackfillDone
 }
 
 func (e Event) JSON() string {
@@ -57,8 +60,12 @@ func NewInProcBus() *InProcBus {
 func (b *InProcBus) Publish(_ context.Context, evt Event) {
 	b.mu.RLock()
 	chans := b.subs[evt.StudioID]
-	pending := make([]chan Event, 0, len(chans))
+	globalChans := b.subs[uuid.Nil]
+	pending := make([]chan Event, 0, len(chans)+len(globalChans))
 	for _, c := range chans {
+		pending = append(pending, c)
+	}
+	for _, c := range globalChans {
 		pending = append(pending, c)
 	}
 	b.mu.RUnlock()

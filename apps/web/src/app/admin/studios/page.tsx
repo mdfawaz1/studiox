@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import {
-  ArrowRight, Building2, Plus, Megaphone,
-  Users, Activity, TrendingUp, CheckCircle2, Layers
+  Building2, Plus, Megaphone,
+  Users, Activity, CheckCircle2, Layers
 } from 'lucide-react';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
@@ -9,13 +9,48 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { brandInitials } from '@/lib/color';
 import { serverFetch } from '@/lib/auth';
 import type { Studio } from '@/lib/types';
+import { Pagination } from '@/components/ui/Pagination';
+import { StudioFilters } from './StudioFilters';
+import { StudioStatusToggle } from './StudioStatusToggle';
 
 interface ListResp {
   studios: Studio[];
 }
 
-export default async function StudiosListPage() {
+interface SearchParams {
+  page?: string;
+  search?: string;
+  status?: string;
+}
+
+export default async function StudiosListPage({
+  searchParams,
+}: {
+  searchParams: Promise<SearchParams>;
+}) {
+  const sp = await searchParams;
+  const page = Math.max(1, Number(sp.page) || 1);
+  const PAGE_SIZE = 9;
+  const offset = (page - 1) * PAGE_SIZE;
+
   const { studios } = await serverFetch<ListResp>('/api/v1/admin/studios');
+
+  // Filter studios
+  let filtered = studios;
+  if (sp.search) {
+    const sLower = sp.search.toLowerCase();
+    filtered = filtered.filter(s =>
+      s.name.toLowerCase().includes(sLower) ||
+      s.slug.toLowerCase().includes(sLower) ||
+      (s.contactEmail && s.contactEmail.toLowerCase().includes(sLower))
+    );
+  }
+  if (sp.status) {
+    const active = sp.status === 'active';
+    filtered = filtered.filter(s => s.active === active);
+  }
+
+  const paginatedStudios = filtered.slice(offset, offset + PAGE_SIZE);
 
   const totalCampaigns = studios.reduce((sum, s) => sum + (s.campaignCount ?? 0), 0);
   const totalLeads     = studios.reduce((sum, s) => sum + (s.leadCount ?? 0), 0);
@@ -27,9 +62,8 @@ export default async function StudiosListPage() {
 
       {/* ── Page header ───────────────────────── */}
       <div
-        className="relative overflow-hidden rounded-[26px] border border-white/30 p-6 backdrop-blur-2xl dark:border-white/5"
+        className="relative overflow-hidden rounded-[26px] border border-white/30 p-6 backdrop-blur-2xl dark:border-white/5 bg-white/30 dark:bg-neutral-900/30"
         style={{
-          background: 'linear-gradient(135deg, rgba(255,255,255,0.30) 0%, rgba(237,233,254,0.22) 60%, rgba(219,234,254,0.20) 100%)',
           boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.2), 0 8px 32px rgba(139,92,246,0.07)',
         }}
       >
@@ -110,12 +144,33 @@ export default async function StudiosListPage() {
             />
           </div>
 
+          {/* ── Search & Filter Controls ──────── */}
+          <StudioFilters search={sp.search} status={sp.status} />
+
           {/* ── Studio cards grid ─────────────── */}
-          <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
-            {studios.map((s, idx) => (
-              <StudioCard key={s.id} studio={s} idx={idx} />
-            ))}
-          </div>
+          {filtered.length === 0 ? (
+            <div
+              className="overflow-hidden rounded-[24px] border border-white/30 bg-white/30 backdrop-blur-2xl dark:border-white/5 dark:bg-neutral-900/30 p-8"
+              style={{ boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.15)' }}
+            >
+              <EmptyState
+                icon={<Building2 className="h-8 w-8 text-zinc-400" />}
+                title="No studios match your search"
+                description="Try clearing your search query or status filter to see all studios."
+              />
+            </div>
+          ) : (
+            <>
+              <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
+                {paginatedStudios.map((s, idx) => (
+                  <StudioCard key={s.id} studio={s} idx={idx} />
+                ))}
+              </div>
+
+              {/* Pagination */}
+              <Pagination total={filtered.length} pageSize={PAGE_SIZE} page={page} />
+            </>
+          )}
         </>
       )}
     </div>
@@ -128,37 +183,55 @@ export default async function StudiosListPage() {
 
 type CardColor = 'violet' | 'emerald' | 'sky' | 'amber';
 
-const colorMap: Record<CardColor, {
-  bg: string; border: string; iconBg: string; iconText: string;
-  valueTx: string; hint: string; shadow: string; glow: string;
+const colorClasses: Record<CardColor, {
+  cardBg: string;
+  cardBorder: string;
+  labelText: string;
+  valueText: string;
+  hintText: string;
+  iconBg: string;
+  iconText: string;
+  glowBg: string;
 }> = {
   violet: {
-    bg: 'rgba(245,243,255,0.45)', border: 'rgba(196,181,253,0.40)',
-    iconBg: 'rgba(139,92,246,0.12)', iconText: '#7c3aed',
-    valueTx: '#4c1d95', hint: '#7c3aed',
-    shadow: '0 4px 20px rgba(139,92,246,0.10), inset 0 0 0 1px rgba(221,214,254,0.40)',
-    glow: 'rgba(139,92,246,0.15)',
+    cardBg: 'bg-violet-50/45 dark:bg-violet-950/10',
+    cardBorder: 'border-violet-200/40 dark:border-violet-900/20',
+    labelText: 'text-violet-700 dark:text-violet-400',
+    valueText: 'text-violet-950 dark:text-violet-100',
+    hintText: 'text-violet-600 dark:text-violet-400/80',
+    iconBg: 'bg-violet-500/10 dark:bg-violet-400/10',
+    iconText: 'text-violet-700 dark:text-violet-400',
+    glowBg: 'bg-violet-500/10 dark:bg-violet-400/10',
   },
   emerald: {
-    bg: 'rgba(236,253,245,0.45)', border: 'rgba(110,231,183,0.40)',
-    iconBg: 'rgba(16,185,129,0.12)', iconText: '#059669',
-    valueTx: '#065f46', hint: '#10b981',
-    shadow: '0 4px 20px rgba(16,185,129,0.10), inset 0 0 0 1px rgba(167,243,208,0.40)',
-    glow: 'rgba(16,185,129,0.15)',
+    cardBg: 'bg-emerald-50/45 dark:bg-emerald-950/10',
+    cardBorder: 'border-emerald-200/40 dark:border-emerald-900/20',
+    labelText: 'text-emerald-700 dark:text-emerald-400',
+    valueText: 'text-emerald-950 dark:text-emerald-100',
+    hintText: 'text-emerald-600 dark:text-emerald-400/80',
+    iconBg: 'bg-emerald-500/10 dark:bg-emerald-400/10',
+    iconText: 'text-emerald-700 dark:text-emerald-400',
+    glowBg: 'bg-emerald-500/10 dark:bg-emerald-400/10',
   },
   sky: {
-    bg: 'rgba(240,249,255,0.45)', border: 'rgba(125,211,252,0.40)',
-    iconBg: 'rgba(14,165,233,0.12)', iconText: '#0284c7',
-    valueTx: '#0c4a6e', hint: '#0ea5e9',
-    shadow: '0 4px 20px rgba(14,165,233,0.10), inset 0 0 0 1px rgba(186,230,253,0.40)',
-    glow: 'rgba(14,165,233,0.15)',
+    cardBg: 'bg-sky-50/45 dark:bg-sky-950/10',
+    cardBorder: 'border-sky-200/40 dark:border-sky-900/20',
+    labelText: 'text-sky-700 dark:text-sky-400',
+    valueText: 'text-sky-950 dark:text-sky-100',
+    hintText: 'text-sky-600 dark:text-sky-400/80',
+    iconBg: 'bg-sky-500/10 dark:bg-sky-400/10',
+    iconText: 'text-sky-700 dark:text-sky-400',
+    glowBg: 'bg-sky-500/10 dark:bg-sky-400/10',
   },
   amber: {
-    bg: 'rgba(255,251,235,0.45)', border: 'rgba(252,211,77,0.40)',
-    iconBg: 'rgba(245,158,11,0.12)', iconText: '#d97706',
-    valueTx: '#78350f', hint: '#f59e0b',
-    shadow: '0 4px 20px rgba(245,158,11,0.10), inset 0 0 0 1px rgba(253,230,138,0.40)',
-    glow: 'rgba(245,158,11,0.15)',
+    cardBg: 'bg-amber-50/45 dark:bg-amber-950/10',
+    cardBorder: 'border-amber-200/40 dark:border-amber-900/20',
+    labelText: 'text-amber-700 dark:text-amber-400',
+    valueText: 'text-amber-950 dark:text-amber-100',
+    hintText: 'text-amber-600 dark:text-amber-400/80',
+    iconBg: 'bg-amber-500/10 dark:bg-amber-400/10',
+    iconText: 'text-amber-700 dark:text-amber-400',
+    glowBg: 'bg-amber-500/10 dark:bg-amber-400/10',
   },
 };
 
@@ -167,34 +240,31 @@ function SummaryCard({
 }: {
   label: string; value: number; icon: React.ReactNode; color: CardColor; hint?: string;
 }) {
-  const c = colorMap[color];
+  const c = colorClasses[color];
   return (
     <div
-      className="relative overflow-hidden rounded-[20px] p-5 backdrop-blur-2xl"
-      style={{ background: c.bg, border: `1px solid ${c.border}`, boxShadow: c.shadow }}
+      className={`relative overflow-hidden rounded-[20px] p-5 backdrop-blur-2xl border ${c.cardBg} ${c.cardBorder}`}
     >
       {/* Glow blob */}
       <div
-        className="pointer-events-none absolute -right-6 -top-6 h-20 w-20 rounded-full blur-2xl"
-        style={{ background: c.glow }}
+        className={`pointer-events-none absolute -right-6 -top-6 h-20 w-20 rounded-full blur-2xl ${c.glowBg}`}
       />
       <div className="relative flex items-start justify-between gap-3">
         <div>
-          <div className="text-[10px] font-black uppercase tracking-[0.18em]" style={{ color: c.iconText }}>
+          <div className={`text-[10px] font-black uppercase tracking-[0.18em] ${c.labelText}`}>
             {label}
           </div>
-          <div className="mt-2 text-3xl font-black tracking-tight" style={{ color: c.valueTx }}>
+          <div className={`mt-2 text-3xl font-black tracking-tight ${c.valueText}`}>
             {value}
           </div>
           {hint && (
-            <div className="mt-1 text-[11px] font-bold" style={{ color: c.hint }}>
+            <div className={`mt-1 text-[11px] font-bold ${c.hintText}`}>
               {hint}
             </div>
           )}
         </div>
         <div
-          className="grid h-10 w-10 shrink-0 place-items-center rounded-xl"
-          style={{ background: c.iconBg, color: c.iconText }}
+          className={`grid h-10 w-10 shrink-0 place-items-center rounded-xl ${c.iconBg} ${c.iconText}`}
         >
           {icon}
         </div>
@@ -206,114 +276,72 @@ function SummaryCard({
 // ─────────────────────────────────────────────────────
 // Studio card
 // ─────────────────────────────────────────────────────
+// Studio card — non-navigable, super-admin management only
+// ─────────────────────────────────────────────────────
 
 function StudioCard({ studio: s, idx }: { studio: Studio; idx: number }) {
-  return (
-    <Link
-      href={`/admin/studios/${s.id}`}
-      className="group block focus:outline-none"
+  const isDisabled = !s.managedBy1Hero;
+
+  const cardDiv = (
+    <div
+      className={`relative h-full overflow-hidden rounded-[24px] backdrop-blur-2xl border border-white/30 dark:border-white/5 dark:bg-neutral-900/30 transition-all ${
+        isDisabled
+          ? 'opacity-50 cursor-not-allowed bg-white/30'
+          : 'cursor-pointer bg-white/30 hover:shadow-lg hover:scale-[1.02]'
+      }`}
+      style={{
+        boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.15), 0 8px 32px rgba(0,0,0,0.07)',
+      }}
     >
-      <div
-        className="relative h-full overflow-hidden rounded-[24px] backdrop-blur-2xl transition-all duration-500 hover:-translate-y-1.5 hover:scale-[1.012]"
-        style={{
-          background: 'linear-gradient(145deg, rgba(255,255,255,0.38) 0%, rgba(248,245,255,0.30) 100%)',
-          border: '1px solid rgba(255,255,255,0.35)',
-          boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.20), 0 4px 24px rgba(0,0,0,0.06)',
-        }}
-      >
-        {/* Brand color top bar with gradient fade */}
-        <div
-          className="relative h-1.5 w-full"
-          style={{ background: `linear-gradient(90deg, ${s.brandColor} 0%, ${s.brandColor}88 100%)` }}
-        />
+      <div className="relative h-24 w-full overflow-hidden" style={{ background: `linear-gradient(135deg, ${s.brandColor} 0%, ${s.brandColor}cc 60%, ${s.brandColor}88 100%)` }}>
+        <div className="absolute inset-0 opacity-20" style={{ backgroundImage: `radial-gradient(circle at 80% 20%, white 0%, transparent 50%), radial-gradient(circle at 20% 80%, white 0%, transparent 40%)` }} />
+        <div className="absolute right-4 top-4 flex items-center gap-2 rounded-xl bg-white/20 backdrop-blur-md p-1.5 border border-white/10 pointer-events-auto">
+          <Badge tone={s.active ? 'success' : 'neutral'} className="text-[10px] font-black uppercase tracking-wider shadow-sm select-none pointer-events-none">{s.active ? 'Active' : 'Inactive'}</Badge>
+          <StudioStatusToggle studioId={s.id} initialActive={s.active} studioName={s.name} />
+        </div>
+      </div>
 
-        {/* Subtle brand color ambient glow */}
-        <div
-          className="pointer-events-none absolute -right-10 -top-10 h-32 w-32 rounded-full blur-3xl opacity-20 transition-opacity duration-500 group-hover:opacity-40"
-          style={{ background: s.brandColor }}
-        />
-
-        <div className="p-6">
-          {/* Top row: logo + name + badge */}
-          <div className="flex items-start gap-4">
-            <div
-              className="relative grid h-14 w-14 shrink-0 place-items-center overflow-hidden rounded-[18px] text-lg font-black text-white shadow-lg ring-4 ring-white/40 transition-transform duration-500 group-hover:scale-110 group-hover:rotate-3 dark:ring-white/10"
-              style={{ background: s.brandColor }}
-            >
-              {s.logoUrl ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img src={s.logoUrl} alt="" className="h-full w-full object-cover" />
-              ) : (
-                brandInitials(s.name)
-              )}
-              {/* Shine overlay */}
-              <div className="absolute inset-0 bg-gradient-to-br from-white/20 to-transparent" />
-            </div>
-
-            <div className="min-w-0 flex-1 pt-0.5">
-              <div className="flex items-center justify-between gap-2">
-                <h3 className="truncate text-base font-black text-zinc-900 transition-colors group-hover:text-brand-600 dark:text-white dark:group-hover:text-brand-400">
-                  {s.name}
-                </h3>
-                <Badge
-                  tone={s.active ? 'success' : 'neutral'}
-                  className="shrink-0 text-[10px] font-black uppercase tracking-wider"
-                >
-                  {s.active ? 'Active' : 'Inactive'}
-                </Badge>
-              </div>
-              <div className="mt-1 flex items-center gap-1.5 font-mono text-[10px] font-bold uppercase tracking-wider text-zinc-400">
-                <Building2 className="h-3 w-3" />
-                /{s.slug}
-              </div>
-              {/* Description line */}
-              <p className="mt-1.5 text-[11px] font-semibold leading-relaxed text-zinc-500 dark:text-zinc-400 line-clamp-1">
-                {s.contactEmail ?? 'No contact email set'}
-              </p>
-            </div>
+      <div className="relative px-5 pb-5 pointer-events-none">
+        <div className="-mt-7 mb-3 flex items-end justify-between">
+          <div className="relative grid h-14 w-14 shrink-0 place-items-center overflow-hidden rounded-[16px] text-lg font-black text-white shadow-lg ring-4 ring-white dark:ring-neutral-900" style={{ background: s.brandColor }}>
+            {s.logoUrl ? <img src={s.logoUrl} alt="" className="h-full w-full object-cover" /> : brandInitials(s.name)}
+            <div className="absolute inset-0 bg-gradient-to-br from-white/25 to-transparent" />
           </div>
+          <div className="grid h-9 w-9 place-items-center rounded-2xl" style={{ background: `${s.brandColor}18` }}>
+            <Building2 className="h-4 w-4" style={{ color: s.brandColor }} />
+          </div>
+        </div>
 
-          {/* Divider */}
-          <div className="my-5 h-px bg-gradient-to-r from-transparent via-white/30 to-transparent dark:via-white/10" />
+        <div className="min-w-0">
+          <h3 className="truncate text-[15px] font-black text-zinc-900 dark:text-white">{s.name}</h3>
+          <div className="mt-0.5 flex items-center gap-1 font-mono text-[10px] font-bold uppercase tracking-wider text-zinc-400"><Building2 className="h-3 w-3" /> /{s.slug}</div>
+          <p className="mt-1 text-[11px] font-medium leading-relaxed text-zinc-500 dark:text-zinc-400 truncate">{s.contactEmail ?? 'No contact email set'}</p>
+        </div>
 
-          {/* Stats row */}
-          <div className="flex items-center justify-between">
-            <div className="flex gap-6">
-              {/* Campaigns */}
-              <div className="flex items-center gap-2">
-                <div className="grid h-8 w-8 place-items-center rounded-xl bg-sky-50/70 text-sky-600 dark:bg-sky-500/10 dark:text-sky-400">
-                  <Megaphone className="h-3.5 w-3.5" />
-                </div>
-                <div>
-                  <div className="text-base font-black text-zinc-900 dark:text-white">{s.campaignCount ?? 0}</div>
-                  <div className="text-[9px] font-black uppercase tracking-widest text-zinc-400">Campaigns</div>
-                </div>
-              </div>
-              {/* Leads */}
-              <div className="flex items-center gap-2">
-                <div className="grid h-8 w-8 place-items-center rounded-xl bg-violet-50/70 text-violet-600 dark:bg-violet-500/10 dark:text-violet-400">
-                  <Users className="h-3.5 w-3.5" />
-                </div>
-                <div>
-                  <div className="text-base font-black text-zinc-900 dark:text-white">{s.leadCount ?? 0}</div>
-                  <div className="text-[9px] font-black uppercase tracking-widest text-zinc-400">Leads</div>
-                </div>
-              </div>
-            </div>
+        <div className="my-4 h-px bg-gradient-to-r from-transparent via-white/40 to-transparent dark:via-white/10" />
 
-            {/* Arrow CTA */}
-            <div
-              className="grid h-10 w-10 place-items-center rounded-2xl text-zinc-400 transition-all duration-300 group-hover:scale-110 group-hover:text-white"
-              style={{ background: 'rgba(255,255,255,0.4)' }}
-            >
-              <ArrowRight
-                className="h-5 w-5 transition-transform duration-300 group-hover:translate-x-0.5"
-                style={{ color: 'inherit' }}
-              />
-            </div>
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2 flex-1">
+            <div className="grid h-8 w-8 place-items-center rounded-xl bg-sky-50/80 text-sky-600 dark:bg-sky-500/10 dark:text-sky-400"><Megaphone className="h-3.5 w-3.5" /></div>
+            <div><div className="text-sm font-black text-zinc-900 dark:text-white leading-none">{s.campaignCount ?? 0}</div><div className="text-[9px] font-black uppercase tracking-widest text-zinc-400 mt-0.5">Campaigns</div></div>
+          </div>
+          <div className="h-8 w-px bg-white/30 dark:bg-white/10" />
+          <div className="flex items-center gap-2 flex-1">
+            <div className="grid h-8 w-8 place-items-center rounded-xl bg-violet-50/80 text-violet-600 dark:bg-violet-500/10 dark:text-violet-400"><Users className="h-3.5 w-3.5" /></div>
+            <div><div className="text-sm font-black text-zinc-900 dark:text-white leading-none">{s.leadCount ?? 0}</div><div className="text-[9px] font-black uppercase tracking-widest text-zinc-400 mt-0.5">Leads</div></div>
+          </div>
+          <div className="h-8 w-px bg-white/30 dark:bg-white/10" />
+          <div className="flex items-center gap-2 flex-1">
+            <div className="grid h-8 w-8 place-items-center rounded-xl bg-emerald-50/80 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400"><Activity className="h-3.5 w-3.5" /></div>
+            <div><div className="text-[9px] font-black uppercase tracking-widest text-zinc-400 mt-0.5">Status</div><div className="text-[10px] font-black mt-0.5" style={{ color: s.active ? '#10b981' : '#94a3b8' }}>{s.active ? 'Live' : 'Paused'}</div></div>
           </div>
         </div>
       </div>
-    </Link>
+
+      <div className="pointer-events-none absolute -right-10 -top-10 h-40 w-40 rounded-full blur-3xl opacity-10" style={{ background: s.brandColor }} />
+    </div>
   );
+
+  return isDisabled ? cardDiv : <Link href={`/admin/studios/${s.id}`} className="block h-full">{cardDiv}</Link>;
 }
+

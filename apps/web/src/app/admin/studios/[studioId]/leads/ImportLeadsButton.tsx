@@ -23,6 +23,7 @@ export function ImportLeadsButton({ studioId, campaigns }: ImportLeadsButtonProp
   const [dragActive, setDragActive] = useState(false);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
 
   useEffect(() => {
     setMounted(true);
@@ -72,6 +73,7 @@ export function ImportLeadsButton({ studioId, campaigns }: ImportLeadsButtonProp
       const res = await importLeadsAction(studioId, formData);
       if (res.ok) {
         setResult({ ok: true, message: res.message || 'Leads imported successfully.' });
+        setToast({ message: res.message || 'Leads imported successfully.', type: 'success' });
         router.refresh();
         setTimeout(() => {
           setIsOpen(false);
@@ -80,9 +82,11 @@ export function ImportLeadsButton({ studioId, campaigns }: ImportLeadsButtonProp
         }, 2000);
       } else {
         setResult({ ok: false, message: res.error || 'Failed to import leads.' });
+        setToast({ message: res.error || 'Failed to import leads.', type: 'error' });
       }
     } catch (err: any) {
       setResult({ ok: false, message: err.message || 'An error occurred during import.' });
+      setToast({ message: err.message || 'An error occurred during import.', type: 'error' });
     } finally {
       setLoading(false);
     }
@@ -93,9 +97,10 @@ export function ImportLeadsButton({ studioId, campaigns }: ImportLeadsButtonProp
       <Button
         onClick={() => setIsOpen(true)}
         variant="ghost"
-        className="flex items-center gap-2 rounded-full border border-white/20 bg-white/10 px-4 py-2 text-xs font-bold text-zinc-700 hover:bg-white/20 dark:text-zinc-200 dark:hover:bg-neutral-800/50"
+        size="sm"
+        leftIcon={<Upload className="h-3.5 w-3.5" />}
+        className="rounded-xl border border-white/20 bg-white/10 px-3 py-1.5 text-xs font-bold text-zinc-700 hover:bg-white/20 dark:text-zinc-200 dark:hover:bg-neutral-800/50 shadow-sm shrink-0"
       >
-        <Upload className="h-4 w-4" />
         Import Leads
       </Button>
 
@@ -120,20 +125,40 @@ export function ImportLeadsButton({ studioId, campaigns }: ImportLeadsButtonProp
             </div>
 
             <form onSubmit={handleImport} className="mt-5 space-y-5">
+              <div className="flex items-center justify-between rounded-2xl border border-zinc-200/50 bg-zinc-100/50 p-4 dark:border-zinc-800/50 dark:bg-zinc-800/30">
+                <div className="flex flex-col min-w-0 pr-2">
+                  <span className="text-xs font-black text-zinc-900 dark:text-white">Import Template</span>
+                  <span className="text-[10px] text-zinc-400 truncate">Download the format template for importing leads</span>
+                </div>
+                <a
+                  href="/lead_import_template.csv"
+                  download="lead_import_template.csv"
+                  className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-violet-500/10 px-3.5 py-1.5 text-[10px] font-black uppercase tracking-widest text-violet-600 dark:text-violet-400 hover:bg-violet-500/20 transition-colors"
+                >
+                  Download
+                </a>
+              </div>
               <div>
                 <Label htmlFor="campaign-select">Default Campaign</Label>
-                <select
-                  id="campaign-select"
-                  value={campaignId}
-                  onChange={(e) => setCampaignId(e.target.value)}
-                  className="mt-1.5 w-full rounded-2xl border border-zinc-200 bg-white/50 px-4 py-3 text-sm focus:border-brand-500 focus:outline-none dark:border-zinc-800 dark:bg-zinc-950/50"
-                >
-                  {campaigns.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name}
-                    </option>
-                  ))}
-                </select>
+                {campaigns.length === 0 ? (
+                  <div className="mt-1.5 flex items-center gap-2 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs font-semibold text-amber-700 dark:border-amber-800/50 dark:bg-amber-900/20 dark:text-amber-400">
+                    No campaigns found. Please create a campaign first before importing leads.
+                  </div>
+                ) : (
+                  <select
+                    id="campaign-select"
+                    value={campaignId}
+                    onChange={(e) => setCampaignId(e.target.value)}
+                    className="mt-1.5 w-full rounded-2xl border border-zinc-200 bg-white px-4 py-3 text-sm font-semibold text-zinc-800 focus:border-brand-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+                  >
+                    <option value="">— Select a campaign —</option>
+                    {campaigns.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name}
+                      </option>
+                    ))}
+                  </select>
+                )}
                 <p className="mt-1 text-[11px] text-zinc-400">
                   Leads will be assigned to this campaign if not specified in the file.
                 </p>
@@ -219,6 +244,34 @@ export function ImportLeadsButton({ studioId, campaigns }: ImportLeadsButtonProp
           </div>
         </div>,
         document.body
+      )}
+      {/* Custom Floating Toast Notification */}
+      {toast && (
+        <div className={`fixed bottom-6 right-6 z-[9999] p-4 rounded-2xl border backdrop-blur-xl shadow-2xl flex items-center gap-3 animate-in slide-in-from-bottom-5 fade-in duration-300 min-w-[320px] ${
+          toast.type === 'success' 
+            ? 'border-emerald-500/30 bg-white/90 dark:bg-zinc-900/90' 
+            : 'border-red-500/30 bg-white/90 dark:bg-zinc-900/90'
+        }`}>
+          <div className={`h-8 w-8 rounded-xl flex items-center justify-center shrink-0 ${
+            toast.type === 'success' 
+              ? 'bg-emerald-500/10 text-emerald-500' 
+              : 'bg-red-500/10 text-red-500'
+          }`}>
+            {toast.type === 'success' ? <CheckCircle2 className="w-5 h-5" /> : <AlertCircle className="w-5 h-5" />}
+          </div>
+          <div className="flex-1 text-left">
+            <p className="text-xs font-black uppercase tracking-wider text-zinc-800 dark:text-zinc-100">
+              {toast.type === 'success' ? 'Success' : 'Error'}
+            </p>
+            <p className="text-[10px] text-zinc-550 dark:text-zinc-400 font-semibold mt-0.5">{toast.message}</p>
+          </div>
+          <button 
+            onClick={() => setToast(null)} 
+            className="text-zinc-400 hover:text-zinc-655 dark:hover:text-white p-1 rounded-lg transition-colors"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
       )}
     </>
   );

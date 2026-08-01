@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.6
 #
 # Build context: repo root.
 #   docker build -f deploy/web.Dockerfile -t projectx-web .
@@ -10,6 +9,8 @@
 FROM node:22-alpine AS deps
 WORKDIR /repo
 RUN corepack enable
+ARG API_BASE_URL=http://localhost:8080
+ENV API_BASE_URL=${API_BASE_URL}
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY apps/web/package.json apps/web/
 RUN pnpm install --frozen-lockfile
@@ -18,6 +19,8 @@ RUN pnpm install --frozen-lockfile
 FROM node:22-alpine AS build
 WORKDIR /repo
 RUN corepack enable
+ARG API_BASE_URL=http://localhost:8080
+ENV API_BASE_URL=${API_BASE_URL}
 COPY --from=deps /repo/node_modules        ./node_modules
 COPY --from=deps /repo/apps/web/node_modules ./apps/web/node_modules
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./

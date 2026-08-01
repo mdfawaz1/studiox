@@ -4,6 +4,7 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -38,11 +39,16 @@ func (h *Handler) AdminRoutes(r chi.Router) {
 
 	r.Get("/leads", h.listLeads)
 	r.Get("/leads/stats", h.leadStats)
+	r.Get("/analytics", h.getAnalytics)
 	r.Get("/leads/sheets-settings", h.getSheetsSettings)
 	r.Post("/leads/sheets-settings", h.saveSheetsSettings)
+	r.Get("/leads/external-sheet-settings", h.getExternalLeadsSheetSettings)
+	r.Post("/leads/external-sheet-settings", h.saveExternalLeadsSheetSettings)
 	r.Post("/leads/import", h.importLeads)
+	r.Get("/leads/sources", h.listUniqueSources)
 	r.Get("/leads/{id}", h.getLead)
 	r.Patch("/leads/{id}", h.patchLead)
+	r.Patch("/leads/{id}/dnd", h.setLeadDND)
 }
 
 // PublicRoutes are unauthenticated.
@@ -59,14 +65,23 @@ func (h *Handler) PublicRoutes(r chi.Router) {
 // short-circuits with the right error response if forbidden.
 func (h *Handler) resolveStudioID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
 	c := identity.MustClaims(r.Context())
+
+	// Super admins can access any studio via URL param
 	if c.IsSuper() {
-		pathID, err := uuid.Parse(chi.URLParam(r, "studioId"))
-		if err != nil {
-			httpx.WriteError(w, http.StatusBadRequest, "bad_studio_id", "invalid studio id")
+		studioIDStr := chi.URLParam(r, "studioId")
+		if studioIDStr == "" {
+			httpx.WriteError(w, http.StatusBadRequest, "bad_request", "studioId parameter required")
 			return uuid.Nil, false
 		}
-		return pathID, true
+		studioID, err := uuid.Parse(studioIDStr)
+		if err != nil {
+			httpx.WriteError(w, http.StatusBadRequest, "bad_request", "invalid studioId format")
+			return uuid.Nil, false
+		}
+		return studioID, true
 	}
+
+	// Studio admins use their bound studio
 	if c.StudioID == nil {
 		httpx.WriteError(w, http.StatusForbidden, "forbidden", "no studio bound to this user")
 		return uuid.Nil, false
@@ -129,7 +144,20 @@ func (h *Handler) listCampaigns(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	list, err := h.svc.ListCampaigns(r.Context(), studioID)
+	limitVal := 50
+	if lStr := r.URL.Query().Get("limit"); lStr != "" {
+		if val, err := strconv.Atoi(lStr); err == nil && val > 0 {
+			limitVal = val
+		}
+	}
+	offsetVal := 0
+	if oStr := r.URL.Query().Get("offset"); oStr != "" {
+		if val, err := strconv.Atoi(oStr); err == nil && val >= 0 {
+			offsetVal = val
+		}
+	}
+
+	list, total, err := h.svc.ListCampaigns(r.Context(), studioID, limitVal, offsetVal)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "internal", "internal server error")
 		return
@@ -138,7 +166,10 @@ func (h *Handler) listCampaigns(w http.ResponseWriter, r *http.Request) {
 	for i := range list {
 		out = append(out, h.toCampaignRes(&list[i]))
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"campaigns": out})
+	httpx.JSON(w, http.StatusOK, map[string]any{
+		"campaigns": out,
+		"total":     total,
+	})
 }
 
 func (h *Handler) getCampaign(w http.ResponseWriter, r *http.Request) {
@@ -241,6 +272,37 @@ func (h *Handler) listLeads(w http.ResponseWriter, r *http.Request) {
 			f.Status = &s
 		}
 	}
+	if v := q.Get("statuses"); v != "" {
+		parts := strings.Split(v, ",")
+		for _, p := range parts {
+			s := LeadStatus(p)
+			if s.Valid() {
+				f.Statuses = append(f.Statuses, s)
+			}
+		}
+	}
+	if v := q.Get("maxAttempts"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err == nil {
+			f.MaxAttempts = &n
+		}
+	}
+	if v := q.Get("source"); v != "" {
+		f.Source = v
+	}
+	if v := q.Get("startDate"); v != "" {
+		f.StartDate = v
+	}
+	if v := q.Get("endDate"); v != "" {
+		f.EndDate = v
+	}
+	if v := q.Get("duration"); v != "" {
+		v = strings.TrimSuffix(v, "d")
+		n, err := strconv.Atoi(v)
+		if err == nil {
+			f.DurationDays = n
+		}
+	}
 	if v := q.Get("hotLead"); v != "" {
 		b, err := strconv.ParseBool(v)
 		if err == nil {
@@ -267,6 +329,9 @@ func (h *Handler) listLeads(w http.ResponseWriter, r *http.Request) {
 		n, _ := strconv.Atoi(v)
 		f.Offset = n
 	}
+	if v := q.Get("search"); v != "" {
+		f.Search = v
+	}
 
 	list, total, err := h.svc.ListLeads(r.Context(), studioID, f)
 	if err != nil {
@@ -290,6 +355,45 @@ func (h *Handler) leadStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, stats)
+}
+
+func (h *Handler) getAnalytics(w http.ResponseWriter, r *http.Request) {
+	studioID, ok := h.resolveStudioID(w, r)
+	if !ok {
+		return
+	}
+
+	durationStr := r.URL.Query().Get("duration")
+	startDate := r.URL.Query().Get("startDate")
+	endDate := r.URL.Query().Get("endDate")
+
+	var durationDays int
+	if strings.HasSuffix(durationStr, "d") {
+		days, err := strconv.Atoi(strings.TrimSuffix(durationStr, "d"))
+		if err == nil && days > 0 {
+			durationDays = days
+		}
+	} else {
+		switch durationStr {
+		case "15d":
+			durationDays = 15
+		case "30d":
+			durationDays = 30
+		case "90d":
+			durationDays = 90
+		case "365d":
+			durationDays = 365
+		default:
+			durationDays = 0 // all-time
+		}
+	}
+
+	summary, err := h.svc.GetAnalytics(r.Context(), studioID, durationDays, startDate, endDate)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	httpx.JSON(w, http.StatusOK, summary)
 }
 
 func (h *Handler) getLead(w http.ResponseWriter, r *http.Request) {
@@ -320,8 +424,50 @@ type patchLeadReq struct {
 	ContactMade    *bool       `json:"contactMade"`
 	HotLead        *bool       `json:"hotLead"`
 	TrialPurchased *bool       `json:"trialPurchased"`
+	FitnessPlan    *string     `json:"fitnessPlan"`
 	FirstName      *string     `json:"firstName"`
 	LastName       *string     `json:"lastName"`
+	AssignedTo     *string     `json:"assignedTo"`
+	TrialAttended  *bool       `json:"trialAttended"`
+	MemberSold     *bool       `json:"memberSold"`
+	MonthlyFee     *float64    `json:"monthlyFee"`
+	Currency       *string     `json:"currency"`
+	Offer          *string     `json:"offer"`
+	FurtherNotes   *string     `json:"furtherNotes"`
+}
+
+type setLeadDNDReq struct {
+	Enabled bool `json:"enabled"`
+}
+
+// setLeadDND toggles Do Not Disturb for a lead. Turning it on silences all
+// automated messaging (autocontact follow-ups, AI/decision-tree replies) and
+// cancels every already-queued send for this lead; the lead's pipeline
+// status is left untouched.
+func (h *Handler) setLeadDND(w http.ResponseWriter, r *http.Request) {
+	studioID, ok := h.resolveStudioID(w, r)
+	if !ok {
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "bad_id", "invalid id")
+		return
+	}
+	var req setLeadDNDReq
+	if !httpx.DecodeJSON(w, r, &req) {
+		return
+	}
+	lead, err := h.svc.SetDND(r.Context(), studioID, id, req.Enabled)
+	if err != nil {
+		if errors.Is(err, ErrLeadNotFound) {
+			httpx.WriteError(w, http.StatusNotFound, "not_found", "lead not found")
+			return
+		}
+		httpx.WriteError(w, http.StatusInternalServerError, "internal", "internal server error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, lead)
 }
 
 func (h *Handler) patchLead(w http.ResponseWriter, r *http.Request) {
@@ -352,8 +498,16 @@ func (h *Handler) patchLead(w http.ResponseWriter, r *http.Request) {
 	contactMade := current.ContactMade
 	hotLead := current.HotLead
 	trialPurchased := current.TrialPurchased
+	fitnessPlan := current.FitnessPlan
 	firstName := current.FirstName
 	lastName := current.LastName
+	assignedTo := current.AssignedTo
+	trialAttended := current.TrialAttended
+	memberSold := current.MemberSold
+	monthlyFee := current.MonthlyFee
+	currency := current.Currency
+	offer := current.Offer
+	furtherNotes := current.FurtherNotes
 
 	if req.Status != nil {
 		status = *req.Status
@@ -370,14 +524,38 @@ func (h *Handler) patchLead(w http.ResponseWriter, r *http.Request) {
 	if req.TrialPurchased != nil {
 		trialPurchased = *req.TrialPurchased
 	}
+	if req.FitnessPlan != nil {
+		fitnessPlan = *req.FitnessPlan
+	}
 	if req.FirstName != nil {
 		firstName = *req.FirstName
 	}
 	if req.LastName != nil {
 		lastName = *req.LastName
 	}
+	if req.AssignedTo != nil {
+		assignedTo = *req.AssignedTo
+	}
+	if req.TrialAttended != nil {
+		trialAttended = *req.TrialAttended
+	}
+	if req.MemberSold != nil {
+		memberSold = *req.MemberSold
+	}
+	if req.MonthlyFee != nil {
+		monthlyFee = *req.MonthlyFee
+	}
+	if req.Currency != nil {
+		currency = *req.Currency
+	}
+	if req.Offer != nil {
+		offer = *req.Offer
+	}
+	if req.FurtherNotes != nil {
+		furtherNotes = *req.FurtherNotes
+	}
 
-	if err := h.svc.UpdateLead(r.Context(), studioID, id, status, notes, contactMade, hotLead, trialPurchased, firstName, lastName); err != nil {
+	if err := h.svc.UpdateLead(r.Context(), studioID, id, status, currency, notes, contactMade, hotLead, trialPurchased, firstName, lastName, fitnessPlan, assignedTo, trialAttended, memberSold, monthlyFee, offer, furtherNotes); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid", err.Error())
 		return
 	}
@@ -424,6 +602,8 @@ func (h *Handler) publicCampaign(w http.ResponseWriter, r *http.Request) {
 
 type publicSubmitReq struct {
 	Name        string `json:"name"`
+	FirstName   string `json:"firstName"`
+	LastName    string `json:"lastName"`
 	Email       string `json:"email"`
 	Phone       string `json:"phone"`
 	FitnessPlan string `json:"fitnessPlan"`
@@ -437,10 +617,35 @@ func (h *Handler) publicSubmit(w http.ResponseWriter, r *http.Request) {
 	if !httpx.DecodeJSON(w, r, &req) {
 		return
 	}
+	valErrs := map[string]string{}
+	if len(req.Name) > 255 {
+		valErrs["name"] = "must be 255 characters or less"
+	}
+	if len(req.FirstName) > 100 {
+		valErrs["firstName"] = "must be 100 characters or less"
+	}
+	if len(req.LastName) > 100 {
+		valErrs["lastName"] = "must be 100 characters or less"
+	}
+	if len(req.Email) > 255 {
+		valErrs["email"] = "must be 255 characters or less"
+	}
+	if len(req.Phone) > 30 {
+		valErrs["phone"] = "must be 30 characters or less"
+	}
+	if len(req.Goals) > 2000 {
+		valErrs["goals"] = "must be 2000 characters or less"
+	}
+	if len(valErrs) > 0 {
+		httpx.WriteValidationError(w, valErrs)
+		return
+	}
 	lead, errs, err := h.svc.SubmitPublicLead(r.Context(), SubmitLeadInput{
 		StudioSlug:   studioSlug,
 		CampaignSlug: campaignSlug,
 		Name:         req.Name,
+		FirstName:    req.FirstName,
+		LastName:     req.LastName,
 		Email:        req.Email,
 		Phone:        req.Phone,
 		FitnessPlan:  req.FitnessPlan,
@@ -458,6 +663,7 @@ func (h *Handler) publicSubmit(w http.ResponseWriter, r *http.Request) {
 			httpx.WriteError(w, http.StatusNotFound, "not_found", "campaign not found or inactive")
 			return
 		}
+		slog.Error("publicSubmit failed", "err", err)
 		httpx.WriteError(w, http.StatusInternalServerError, "internal", "internal server error")
 		return
 	}
@@ -495,7 +701,6 @@ func (h *Handler) publicBookSlot(w http.ResponseWriter, r *http.Request) {
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
-
 
 // ----- helpers -----
 
@@ -541,6 +746,83 @@ func (h *Handler) saveSheetsSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	settings, err := h.svc.SaveSheetsSettings(r.Context(), studioID, req.SpreadsheetID, req.TabName, req.Active)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "internal", "internal server error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, settings)
+}
+
+type saveExternalLeadsSheetSettingsReq struct {
+	SpreadsheetID   string `json:"spreadsheetId"`
+	TabName         string `json:"tabName"`
+	NameColumn      string `json:"nameColumn"`
+	FirstNameColumn string `json:"firstNameColumn"`
+	LastNameColumn  string `json:"lastNameColumn"`
+	EmailColumn     string `json:"emailColumn"`
+	PhoneColumn     string `json:"phoneColumn"`
+	SourceColumn    string `json:"sourceColumn"`
+	NotesColumn     string `json:"notesColumn"`
+	DateColumn      string `json:"dateColumn"`
+	HotLeadColumn   string `json:"hotLeadColumn"`
+	TrialPurchasedColumn string `json:"trialPurchasedColumn"`
+	ContinueAIAfterGreeting bool `json:"continueAiAfterGreeting"`
+	Active          bool   `json:"active"`
+}
+
+func (h *Handler) getExternalLeadsSheetSettings(w http.ResponseWriter, r *http.Request) {
+	studioID, ok := h.resolveStudioID(w, r)
+	if !ok {
+		return
+	}
+	settings, err := h.svc.GetExternalLeadsSheetSettings(r.Context(), studioID)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "internal", "internal server error")
+		return
+	}
+	if settings == nil {
+		httpx.JSON(w, http.StatusOK, map[string]any{
+			"spreadsheetId": "", "tabName": "Sheet1",
+			"nameColumn": "", "firstNameColumn": "A", "lastNameColumn": "B",
+			"emailColumn": "C", "phoneColumn": "D", "sourceColumn": "", "notesColumn": "", "dateColumn": "",
+			"hotLeadColumn": "", "trialPurchasedColumn": "",
+			"continueAiAfterGreeting": true,
+			"active": false,
+		})
+		return
+	}
+	httpx.JSON(w, http.StatusOK, settings)
+}
+
+func (h *Handler) saveExternalLeadsSheetSettings(w http.ResponseWriter, r *http.Request) {
+	studioID, ok := h.resolveStudioID(w, r)
+	if !ok {
+		return
+	}
+	var req saveExternalLeadsSheetSettingsReq
+	if !httpx.DecodeJSON(w, r, &req) {
+		return
+	}
+	if req.SpreadsheetID == "" {
+		httpx.WriteValidationError(w, map[string]string{"spreadsheetId": "required"})
+		return
+	}
+	settings, err := h.svc.SaveExternalLeadsSheetSettings(r.Context(), studioID, ExternalLeadsSheetSettings{
+		SpreadsheetID:   req.SpreadsheetID,
+		TabName:         req.TabName,
+		NameColumn:      req.NameColumn,
+		FirstNameColumn: req.FirstNameColumn,
+		LastNameColumn:  req.LastNameColumn,
+		EmailColumn:     req.EmailColumn,
+		PhoneColumn:     req.PhoneColumn,
+		SourceColumn:    req.SourceColumn,
+		NotesColumn:     req.NotesColumn,
+		DateColumn:      req.DateColumn,
+		HotLeadColumn:   req.HotLeadColumn,
+		TrialPurchasedColumn: req.TrialPurchasedColumn,
+		ContinueAIAfterGreeting: req.ContinueAIAfterGreeting,
+		Active:          req.Active,
+	})
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "internal", "internal server error")
 		return
@@ -619,4 +901,17 @@ func (h *Handler) importLeads(w http.ResponseWriter, r *http.Request) {
 		"imported": count,
 		"message":  fmt.Sprintf("Successfully imported %d leads", count),
 	})
+}
+
+func (h *Handler) listUniqueSources(w http.ResponseWriter, r *http.Request) {
+	studioID, ok := h.resolveStudioID(w, r)
+	if !ok {
+		return
+	}
+	sources, err := h.svc.GetUniqueSources(r.Context(), studioID)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "internal", "internal server error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, sources)
 }

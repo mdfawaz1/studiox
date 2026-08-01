@@ -26,6 +26,13 @@ type Config struct {
 
 	PublicFormBaseURL string
 
+	// PublicAPIBaseURL is this API's own externally-reachable base URL (e.g.
+	// https://studio.example.com/api in prod, behind nginx). Used to build
+	// per-channel webhook URLs we register with third parties at connect
+	// time (currently just Telegram's setWebhook — Meta/Twilio/X webhook
+	// URLs are configured once, manually, in their respective dashboards).
+	PublicAPIBaseURL string
+
 	Sheets SheetsConfig
 
 	// Encryption key for at-rest secrets (channel access tokens). 32-byte
@@ -36,7 +43,18 @@ type Config struct {
 	// own WABA + access token via the Channels page).
 	Meta   MetaConfig
 	Claude ClaudeConfig
+	Groq   GroqConfig
+	S3     S3Config
+	Glofox GlofoxConfig
 }
+
+type GlofoxConfig struct {
+	APIKey   string
+	APIToken string
+	BranchID string // Glofox _id of the branch/location (x-glofox-branch-id)
+}
+
+func (g GlofoxConfig) Enabled() bool { return g.APIKey != "" && g.APIToken != "" && g.BranchID != "" }
 
 type MetaConfig struct {
 	AppID              string
@@ -48,6 +66,22 @@ type MetaConfig struct {
 type ClaudeConfig struct {
 	APIURL string
 	APIKey string
+}
+
+type GroqConfig struct {
+	APIKey string
+}
+
+type S3Config struct {
+	Region        string
+	AccessKeyID   string
+	SecretKey     string
+	Bucket        string
+	PublicURLBase string
+}
+
+func (s S3Config) Enabled() bool {
+	return s.Region != "" && s.AccessKeyID != "" && s.SecretKey != "" && s.Bucket != ""
 }
 
 func (m MetaConfig) Enabled() bool {
@@ -121,7 +155,7 @@ func Load() (Config, error) {
 		},
 		Cookie: CookieConfig{
 			Name:   getEnv("COOKIE_NAME", "px_session"),
-			Domain: getEnv("COOKIE_DOMAIN", "localhost"),
+			Domain: os.Getenv("COOKIE_DOMAIN"),
 			Secure: getEnv("COOKIE_SECURE", "false") == "true",
 		},
 		SuperUser: SuperUserConfig{
@@ -129,6 +163,7 @@ func Load() (Config, error) {
 			Password: getEnv("SUPER_ADMIN_PASSWORD", ""),
 		},
 		PublicFormBaseURL: getEnv("PUBLIC_FORM_BASE_URL", "http://localhost:3000"),
+		PublicAPIBaseURL:  getEnv("PUBLIC_API_BASE_URL", "http://localhost:8080"),
 		Sheets: SheetsConfig{
 			CredentialsPath: getEnv("GOOGLE_CREDENTIALS_PATH", ""),
 			SpreadsheetID:   getEnv("GOOGLE_SHEETS_ID", ""),
@@ -144,6 +179,21 @@ func Load() (Config, error) {
 		Claude: ClaudeConfig{
 			APIURL: getEnv("CLAUDE_API_URL", "https://api.anthropic.com/v1/messages"),
 			APIKey: getEnv("CLAUDE_API_KEY", ""),
+		},
+		Groq: GroqConfig{
+			APIKey: getEnv("GROQ_API_KEY", ""),
+		},
+		S3: S3Config{
+			Region:        getEnv("AWS_REGION", ""),
+			AccessKeyID:   getEnv("AWS_ACCESS_KEY_ID", ""),
+			SecretKey:     getEnv("AWS_SECRET_ACCESS_KEY", ""),
+			Bucket:        getEnv("S3_BUCKET", ""),
+			PublicURLBase: getEnv("S3_PUBLIC_URL", ""),
+		},
+		Glofox: GlofoxConfig{
+			APIKey:   getEnv("GLOFOX_API_KEY", ""),
+			APIToken: getEnv("GLOFOX_API_TOKEN", ""),
+			BranchID: getEnv("GLOFOX_BRANCH_ID", ""),
 		},
 	}
 

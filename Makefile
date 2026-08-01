@@ -2,6 +2,7 @@ ifeq ($(OS),Windows_NT)
 SHELL := cmd.exe
 else
 SHELL := /bin/bash
+export PATH := /usr/local/go/bin:$(PATH)
 endif
 .DEFAULT_GOAL := help
 
@@ -12,7 +13,8 @@ export
 endif
 
 GOOSE := go run github.com/pressly/goose/v3/cmd/goose@v3.22.0
-PG_DSN := postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=$(POSTGRES_SSLMODE)
+# Migrations bypass PgBouncer and go directly to Postgres (DDL needs session mode, not transaction mode)
+PG_DSN := postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):5436/$(POSTGRES_DB)?sslmode=$(POSTGRES_SSLMODE)
 PNPM := $(shell if command -v pnpm >/dev/null 2>&1; then printf 'pnpm'; elif command -v corepack >/dev/null 2>&1; then printf 'corepack pnpm'; else printf 'npx -y pnpm@9.10.0'; fi)
 
 .PHONY: help
@@ -46,6 +48,7 @@ new: migrate-new ## Compatibility alias for `make migrate new name=...`
 migrate-up: ## Apply all pending migrations
 	cd apps/api && $(GOOSE) -dir migrations postgres "$(PG_DSN)" up
 
+
 migrate-down: ## Roll back the most recent migration
 	cd apps/api && $(GOOSE) -dir migrations postgres "$(PG_DSN)" down
 
@@ -62,15 +65,21 @@ seed-admin: ## Seed the super-admin user from .env (idempotent)
 
 # ---------- dev ----------
 .PHONY: api web dev
-api: ## Run the Go API
-	cd apps/api && go run ./cmd/server
+api: ## Run the Go API (auto-reloads on code changes via air)
+	cd apps/api && $(HOME)/go/bin/air
 
 web: ## Run the Next.js web app (admin + public + auth, single app)
 	cd apps/web && $(PNPM) dev
 
-dev: ## Run API + web concurrently (requires `npx`)
-	npx -y concurrently -k -n api,web -c blue,magenta \
-		"\"$(MAKE)\" api" "\"$(MAKE)\" web"
+wa-web: ## Run the WhatsApp Web QR service
+	cd apps/wa-web && node src/index.js
+
+tg-web: ## Run the Telegram QR-login service (reports "not configured" without TELEGRAM_API_ID/HASH in .env)
+	cd apps/tg-web && node src/index.js
+
+dev: ## Run API + web + wa-web + tg-web concurrently (tg-web degrades to "not configured" without TELEGRAM_API_ID/HASH — see docs/SETUP_TELEGRAM_QR.md)
+	$(PNPM) dlx concurrently -n api,web,wa-web,tg-web -c blue,magenta,green,cyan \
+		"\"$(MAKE)\" api" "\"$(MAKE)\" web" "\"$(MAKE)\" wa-web" "\"$(MAKE)\" tg-web"
 
 # ---------- quality ----------
 .PHONY: test lint fmt

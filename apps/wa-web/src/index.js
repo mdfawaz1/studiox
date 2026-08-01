@@ -1,0 +1,170 @@
+import 'dotenv/config';
+import express from 'express';
+import pino from 'pino';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { SessionManager } from './sessions.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Also write to a plain file, not just stdout — stdout here is piped through
+// `make dev`/concurrently into whatever terminal launched it, which isn't
+// reliably readable after the fact (no scrollback access, no grep). The file
+// gives a durable place to actually inspect Baileys' history-sync diagnostics
+// (see sessions.js) without depending on someone copy-pasting terminal output.
+const log = pino(
+  { level: process.env.LOG_LEVEL || 'info' },
+  pino.multistream([
+    { stream: process.stdout },
+    { stream: pino.destination({ dest: path.join(__dirname, '..', 'wa-web.log'), sync: false }) },
+  ]),
+);
+const app = express();
+app.use(express.json());
+
+const PORT = process.env.PORT || 3100;
+const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
+if (!INTERNAL_API_KEY) { console.error('INTERNAL_API_KEY is not set'); process.exit(1); }
+const PROJECTX_API_URL = process.env.PROJECTX_API_URL || 'http://api:8080';
+
+const sessions = new SessionManager({ log, projectxApiUrl: PROJECTX_API_URL });
+
+// Auth middleware — all routes require the internal API key
+app.use((req, res, next) => {
+  if (req.headers['x-internal-key'] !== INTERNAL_API_KEY) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  next();
+});
+
+// GET /sessions/:studioId/qr
+// Returns the current QR code instantly if pre-warmed, or starts and waits.
+app.get('/sessions/:studioId/qr', async (req, res) => {
+  const { studioId } = req.params;
+  try {
+    const result = await sessions.getOrStartSession(studioId);
+    if (result.status === 'connected') {
+      return res.json({ status: 'connected', phone: result.phone });
+    }
+    if (result.status === 'qr' && result.qr) {
+      return res.json({ status: 'qr', qr: result.qr });
+    }
+    return res.json({ status: 'pending' });
+  } catch (err) {
+    log.error({ err, studioId }, 'get qr failed');
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /sessions/:studioId/disconnect
+app.post('/sessions/:studioId/disconnect', async (req, res) => {
+  const { studioId } = req.params;
+  try {
+    await sessions.disconnect(studioId);
+    res.json({ ok: true });
+  } catch (err) {
+    log.error({ err, studioId }, 'disconnect failed');
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /sessions/:studioId/status
+app.get('/sessions/:studioId/status', (req, res) => {
+  const { studioId } = req.params;
+  const status = sessions.getStatus(studioId);
+  res.json(status);
+});
+
+// GET /sessions/:studioId/check/:number — diagnostic: is this number
+// actually registered on WhatsApp? (see SessionManager.checkOnWhatsApp)
+app.get('/sessions/:studioId/check/:number', async (req, res) => {
+  const { studioId, number } = req.params;
+  try {
+    const results = await sessions.checkOnWhatsApp(studioId, number);
+    res.json({ results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /sessions/:studioId/send
+app.post('/sessions/:studioId/send', async (req, res) => {
+  const { studioId } = req.params;
+  const { to, text, mediaUrl, mediaType, caption } = req.body;
+  if (!to) return res.status(400).json({ error: 'to required' });
+  log.info({ studioId, to, hasMedia: !!mediaUrl, textLen: text?.length }, 'wa-web: sending message');
+  try {
+    let result;
+    if (mediaUrl) {
+      result = await sessions.sendMedia(studioId, to, mediaUrl, mediaType, caption || '');
+    } else {
+      if (!text) return res.status(400).json({ error: 'text required when no media' });
+      result = await sessions.sendMessage(studioId, to, text);
+    }
+    log.info({ studioId, to }, 'wa-web: message sent ok');
+    res.json({ ok: true, messageId: result?.key?.id });
+  } catch (err) {
+    log.error({ err: err.message, studioId, to }, 'wa-web: send message failed');
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /sessions/:studioId/prewarm — called by Go API when a studio connects
+app.post('/sessions/:studioId/prewarm', async (req, res) => {
+  const { studioId } = req.params;
+  sessions.prewarm(studioId).catch(err => log.error({ err, studioId }, 'prewarm failed'));
+  res.json({ ok: true });
+});
+
+// POST /sessions/:studioId/backfill — manual nudge from the admin UI. The
+// actual import runs automatically in the background as soon as a session
+// connects (see SessionManager._startSession / _concludeHistoryImport); this
+// just re-syncs the Go API's view of the current state (see
+// SessionManager.backfillHistory for the exact cases it covers).
+app.post('/sessions/:studioId/backfill', async (req, res) => {
+  const { studioId } = req.params;
+  sessions.backfillHistory(studioId).catch(err => log.error({ err, studioId }, 'backfill failed'));
+  res.json({ ok: true, status: 'running' });
+});
+
+app.listen(PORT, () => {
+  log.info({ port: PORT }, 'wa-web service started');
+  // Pre-warm Chrome for all studios that have a whatsapp_web channel.
+  // This runs in background — service is immediately ready to handle requests.
+  prewarmAll();
+  // Backstop so channel_accounts.status can't permanently drift out of sync
+  // with the real session state if a connect/disconnect notification was
+  // ever missed (e.g. the Go API was briefly down).
+  sessions.startStatusReconciliation();
+});
+
+async function prewarmAll() {
+  // Retry until the Go API is ready (it starts concurrently and may not be up yet)
+  for (let attempt = 1; attempt <= 20; attempt++) {
+    try {
+      const res = await fetch(`${PROJECTX_API_URL}/internal/wa-web/studios`, {
+        headers: { 'x-internal-key': INTERNAL_API_KEY },
+      });
+      if (!res.ok) {
+        log.warn({ status: res.status, attempt }, 'wa-web: pre-warm API not ready, retrying...');
+        await sleep(2000);
+        continue;
+      }
+      const { studioIds } = await res.json();
+      log.info({ count: studioIds.length }, 'wa-web: pre-warming studios');
+      for (const id of studioIds) {
+        sessions.prewarm(id).catch(err => log.error({ err, studioId: id }, 'prewarm failed'));
+        await sleep(500);
+      }
+      return;
+    } catch (err) {
+      log.warn({ attempt }, 'wa-web: API not ready yet, retrying in 2s...');
+      await sleep(2000);
+    }
+  }
+  log.error('wa-web: pre-warm failed after all retries');
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}

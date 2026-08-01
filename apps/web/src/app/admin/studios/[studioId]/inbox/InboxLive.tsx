@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams, usePathname } from 'next/navigation';
 import {
   Check,
   MessagesSquare,
@@ -20,6 +20,17 @@ import {
   Loader2,
   Pencil,
   Calendar,
+  Star,
+  Inbox,
+  Mail,
+  Video,
+  Tag,
+  Archive,
+  ListFilter,
+  ArrowUpDown,
+  Phone,
+  Bot,
+  ChevronLeft,
 } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { brandInitials } from '@/lib/color';
@@ -33,14 +44,61 @@ import type {
   SourceKind,
   Attachment,
   Studio,
+  Lead,
 } from '@/lib/types';
+import { ContactDetailsPanel } from './ContactDetailsPanel';
+import { HeaderActions } from '@/components/HeaderActions';
+
+// Strip @c.us / @lid / @s.whatsapp.net suffixes from WA chat IDs for display
+function displayContact(value: string): string {
+  return value ? value.replace(/@[^@]+$/, '') : value;
+}
+
+function getLeadStatusStyles(status: string, active: boolean): string {
+  if (active) {
+    return 'bg-white/20 text-white';
+  }
+  switch (status) {
+    case 'new':
+      return 'bg-blue-500/15 text-blue-600 dark:bg-blue-500/25 dark:text-blue-400';
+    case 'contacted':
+      return 'bg-violet-500/15 text-violet-600 dark:bg-violet-500/25 dark:text-violet-400';
+    case 'trial_booked':
+      return 'bg-emerald-500/15 text-emerald-600 dark:bg-emerald-500/25 dark:text-emerald-400';
+    case 'member':
+      return 'bg-amber-500/15 text-amber-600 dark:bg-amber-500/25 dark:text-amber-400';
+    case 'dropped':
+      return 'bg-rose-500/15 text-rose-600 dark:bg-rose-500/25 dark:text-rose-400';
+    case 'paused':
+      return 'bg-zinc-500/15 text-zinc-600 dark:bg-zinc-500/25 dark:text-zinc-400';
+    default:
+      return 'bg-zinc-100 text-zinc-600 dark:bg-white/5 dark:text-zinc-400';
+  }
+}
+
+function getLeadStatusLabel(status: string): string {
+  switch (status) {
+    case 'new': return 'New';
+    case 'contacted': return 'Connected';
+    case 'trial_booked': return 'Trial';
+    case 'member': return 'Member';
+    case 'dropped': return 'Dropped';
+    case 'paused': return 'Paused';
+    default: return status;
+  }
+}
+
 
 const CHANNEL_BADGE: Record<ChannelKind, { label: string; color: string }> = {
-  whatsapp_meta:  { label: 'WA',  color: '#25D366' },
-  instagram_meta: { label: 'IG',  color: '#E1306C' },
-  messenger_meta: { label: 'FB',  color: '#0084FF' },
-  x_dm:           { label: 'X',   color: '#000000' },
-  sms:            { label: 'SMS', color: '#3b82f6' },
+  whatsapp_meta:  { label: 'WhatsApp (Cloud)',  color: '#25D366' },
+  whatsapp_web:   { label: 'WhatsApp (QR)',     color: '#128C7E' },
+  instagram_meta: { label: 'Instagram',         color: '#E1306C' },
+  messenger_meta: { label: 'Messenger',         color: '#0084FF' },
+  x_dm:           { label: 'X / Twitter',       color: '#000000' },
+  sms:            { label: 'SMS',               color: '#3b82f6' },
+  google_ads:     { label: 'Google Ads',        color: '#4285F4' },
+  telegram:       { label: 'Telegram (Bot)',    color: '#26A5E4' },
+  telegram_mtproto: { label: 'Telegram',        color: '#26A5E4' },
 };
 
 interface SSEEvent {
@@ -87,17 +145,156 @@ export function InboxLive({
   studioId,
   initialConversations,
   studio,
+  initialUnresponded = false,
 }: {
   studioId: string;
   initialConversations: Conversation[];
   studio?: Studio;
+  initialUnresponded?: boolean;
 }) {
   const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   const [mounted, setMounted] = useState(false);
-  const [currentTab, setCurrentTab] = useState<InboxTab>('conversations');
-  const [activeChannel, setActiveChannel] = useState<ChannelKind>('whatsapp_meta');
+
+  const VALID_TABS: InboxTab[] = ['conversations', 'automated_messages', 'snippets', 'trigger_links'];
+  const VALID_CHANNELS: ChannelKind[] = ['whatsapp_web', 'whatsapp_meta', 'instagram_meta', 'messenger_meta', 'sms', 'telegram', 'telegram_mtproto'];
+
+  const initialTab = (VALID_TABS.includes(searchParams.get('tab') as InboxTab) ? searchParams.get('tab') : 'conversations') as InboxTab;
+  const initialChannel = (VALID_CHANNELS.includes(searchParams.get('channel') as ChannelKind) ? searchParams.get('channel') : 'whatsapp_web') as ChannelKind;
+
+  const [currentTab, _setCurrentTab] = useState<InboxTab>(initialTab);
+  const setCurrentTab = useCallback((tab: InboxTab) => {
+    currentTabRef.current = tab;
+    _setCurrentTab(tab);
+    const p = new URLSearchParams(searchParams.toString());
+    p.set('tab', tab);
+    router.replace(`${pathname}?${p.toString()}`, { scroll: false });
+  }, [pathname, router, searchParams]);
+
+  const [activeChannel, setActiveChannel] = useState<ChannelKind>(initialChannel);
+  const [unrespondedOnly, setUnrespondedOnly] = useState(initialUnresponded);
   const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [inboxTab, setInboxTab] = useState<'all' | 'unread' | 'recents' | 'starred'>('all');
+  const [starredIds, setStarredIds] = useState<string[]>([]);
+
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem('projectx_starred_conversations');
+      if (stored) {
+        setStarredIds(JSON.parse(stored));
+      }
+    } catch (e) {
+      console.error('Failed to load starred conversations', e);
+    }
+  }, []);
+
+  const toggleStar = useCallback((e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    setStarredIds((prev) => {
+      const next = prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id];
+      try {
+        localStorage.setItem('projectx_starred_conversations', JSON.stringify(next));
+      } catch (err) {
+        console.error('Failed to save starred conversations', err);
+      }
+      return next;
+    });
+  }, []);
+  const [selectedId, _setSelectedId] = useState<string | null>(null);
+  // Defaults closed so it doesn't pop open full-screen on mobile; desktop
+  // opens it automatically once mounted, since there it's a static sidebar.
+  const [showDetailsPanel, setShowDetailsPanel] = useState(false);
+  // Mobile-only: false = show the conversation list, true = show the open
+  // chat full-screen with a back button. Irrelevant at sm and above, where
+  // list and chat show side by side regardless.
+  const [mobileChatOpen, setMobileChatOpen] = useState(false);
+  const [users, setUsers] = useState<{ id: string; email: string; role: string }[]>([]);
+  const [selectedConvIds, setSelectedConvIds] = useState<string[]>([]);
+  const [globalAI, setGlobalAI] = useState(false);
+  const [globalAISaving, setGlobalAISaving] = useState(false);
+
+  // The existing "AI AUTO-REPLY" toggle does double duty: it still bulk
+  // enables/disables AI on every currently-loaded conversation (original
+  // behavior), and now also drives "continue AI after greeting" for future
+  // leads imported from the studio's external Google Sheet — ON keeps the
+  // AI replying normally after the initial greeting (default); OFF sends
+  // only that first greeting and leaves the rest for manual follow-up.
+  const [sheetSettingsRaw, setSheetSettingsRaw] = useState<Record<string, unknown> | null>(null);
+
+  useEffect(() => {
+    if (!studioId) return;
+    api<Record<string, unknown>>(`/api/v1/studios/${studioId}/leads/external-sheet-settings`)
+      .then((res) => {
+        setSheetSettingsRaw(res);
+        setGlobalAI((res.continueAiAfterGreeting as boolean | undefined) ?? true);
+      })
+      .catch((err) => console.error('Failed to load external sheet settings:', err));
+  }, [studioId]);
+
+  useEffect(() => {
+    if (!studioId) return;
+    api<{ users: { id: string; email: string; role: string }[] }>(`/api/v1/studios/${studioId}/users`)
+      .then((res) => setUsers(res.users))
+      .catch((err) => console.error('Failed to load studio users:', err));
+  }, [studioId]);
+
+  const handleLeadUpdated = useCallback((updatedLead: Lead) => {
+    setConversations((prev) =>
+      prev.map((c) => {
+        if (c.leadId === updatedLead.id) {
+          return {
+            ...c,
+            leadStatus: updatedLead.status,
+            assignedTo: updatedLead.assignedTo,
+          };
+        }
+        return c;
+      })
+    );
+  }, []);
+
+  const handleAssigneeChange = useCallback(async (newAssignee: string) => {
+    if (!selectedId) return;
+    const currentConv = conversations.find(c => c.id === selectedId);
+    if (!currentConv || !currentConv.leadId) return;
+    const leadId = currentConv.leadId;
+    
+    // Optimistic update
+    setConversations((prev) =>
+      prev.map((c) => {
+        if (c.leadId === leadId) {
+          return {
+            ...c,
+            assignedTo: newAssignee,
+          };
+        }
+        return c;
+      })
+    );
+
+    try {
+      await api(`/api/v1/studios/${studioId}/leads/${leadId}`, {
+        method: 'PATCH',
+        json: { assignedTo: newAssignee },
+      });
+    } catch (err) {
+      console.error('Failed to assign conversation owner:', err);
+    }
+  }, [selectedId, conversations, studioId]);
+
+  const setSelectedId = useCallback((id: string | null) => {
+    selectedIdRef.current = id;
+    _setSelectedId(id);
+    // Desktop re-opens the details sidebar on every selection change; on
+    // mobile it stays closed until the contact header is explicitly tapped.
+    if (typeof window !== 'undefined' && window.matchMedia('(min-width: 1024px)').matches) {
+      setShowDetailsPanel(true);
+    }
+    if (id) {
+      setMobileChatOpen(true);
+    }
+  }, []);
   const [messages, setMessages] = useState<Message[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [draft, setDraft] = useState('');
@@ -106,6 +303,8 @@ export function InboxLive({
   const [creatingConversation, setCreatingConversation] = useState(false);
   const [authError, setAuthError] = useState(false);
   const messagesEndRef = useRef<HTMLLIElement>(null);
+  const selectedIdRef = useRef<string | null>(null);
+  const currentTabRef = useRef<InboxTab>(initialTab);
 
   // templates, links, jobs state
   const [templates, setTemplates] = useState<Template[]>([]);
@@ -172,17 +371,54 @@ export function InboxLive({
 
   useEffect(() => {
     setMounted(true);
+    // Desktop shows the details panel by default (static sidebar there);
+    // mobile stays closed until the contact header is tapped.
+    if (window.matchMedia('(min-width: 1024px)').matches) {
+      setShowDetailsPanel(true);
+    }
   }, []);
 
   useEffect(() => {
     if (mounted) {
-      setConversations(initialConversations.filter(c => c.channelKind === activeChannel));
+      let filtered = initialConversations;
+
+      // Awaiting Reply intentionally searches across all channels; otherwise
+      // scope to the active channel tab.
+      if (!unrespondedOnly) {
+        filtered = filtered.filter(c => c.channelKind === activeChannel);
+      }
+
+      // Filter by inbox tab
+      if (inboxTab === 'unread') {
+        filtered = filtered.filter(c => c.unreadCount > 0);
+      } else if (inboxTab === 'recents') {
+        const sevenDaysAgo = new Date();
+        sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+        filtered = filtered.filter(c => new Date(c.lastMessageAt) >= sevenDaysAgo);
+      } else if (inboxTab === 'starred') {
+        filtered = filtered.filter(c => starredIds.includes(c.id));
+      }
+
+      // Filter by awaiting reply (if checked)
+      if (unrespondedOnly) {
+        filtered = filtered.filter(c => c.status === 'open' && c.lastMessageDirection === 'inbound');
+      }
+
+      setConversations(filtered);
     }
-  }, [mounted, initialConversations, activeChannel]);
+  }, [mounted, initialConversations, activeChannel, unrespondedOnly, inboxTab, starredIds]);
 
   useEffect(() => {
+    // Auto-select the first conversation so desktop's three-pane layout
+    // isn't blank on load — but don't route mobile into the chat view for
+    // it; mobile should land on the conversation list until the user taps one.
     if (mounted && !selectedId && conversations.length > 0 && conversations[0]) {
-      setSelectedId(conversations[0].id);
+      const id = conversations[0].id;
+      selectedIdRef.current = id;
+      _setSelectedId(id);
+      if (typeof window !== 'undefined' && window.matchMedia('(min-width: 1024px)').matches) {
+        setShowDetailsPanel(true);
+      }
     }
   }, [mounted, conversations, selectedId]);
 
@@ -196,10 +432,31 @@ export function InboxLive({
 
   const refreshConversations = useCallback(async () => {
     try {
-      const res = await api<{ conversations: Conversation[] }>(
-        `/api/v1/studios/${studioId}/messaging/conversations?limit=50&channelKind=${activeChannel}`,
-      );
-      setConversations(res.conversations);
+      let url = `/api/v1/studios/${studioId}/messaging/conversations?limit=50`;
+      // Awaiting Reply intentionally searches across all channels; otherwise
+      // scope to the active channel tab.
+      if (!unrespondedOnly) {
+        url += `&channelKind=${activeChannel}`;
+      }
+      url += `&status=open`;
+      const res = await api<{ conversations: Conversation[] }>(url, { cache: 'no-store' });
+      let filtered = res.conversations;
+
+      // Filter by inbox tab
+      if (inboxTab === 'unread') {
+        filtered = filtered.filter(c => c.unreadCount > 0);
+      } else if (inboxTab === 'recents') {
+        const sevenDaysAgo = new Date();
+        sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+        filtered = filtered.filter(c => new Date(c.lastMessageAt) >= sevenDaysAgo);
+      } else if (inboxTab === 'starred') {
+        filtered = filtered.filter(c => starredIds.includes(c.id));
+      }
+
+      if (unrespondedOnly) {
+        filtered = filtered.filter(c => c.status === 'open' && c.lastMessageDirection === 'inbound');
+      }
+      setConversations(filtered);
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) {
         handleAuthError();
@@ -207,7 +464,7 @@ export function InboxLive({
       }
       throw error;
     }
-  }, [studioId, activeChannel, handleAuthError]);
+  }, [studioId, activeChannel, unrespondedOnly, inboxTab, starredIds, handleAuthError]);
 
   const refreshMessages = useCallback(
     async (convId: string) => {
@@ -215,6 +472,7 @@ export function InboxLive({
       try {
         const res = await api<{ messages: Message[] }>(
           `/api/v1/studios/${studioId}/messaging/conversations/${convId}/messages?limit=200`,
+          { cache: 'no-store' }
         );
         setMessages(res.messages);
       } catch (error) {
@@ -234,7 +492,7 @@ export function InboxLive({
   const fetchTemplates = useCallback(async () => {
     setLoadingTemplates(true);
     try {
-      const res = await api<{ templates: Template[] }>(`/api/v1/studios/${studioId}/messaging/templates`);
+      const res = await api<{ templates: Template[] }>(`/api/v1/studios/${studioId}/messaging/templates`, { cache: 'no-store' });
       setTemplates(res.templates);
     } catch (err) {
       console.error(err);
@@ -246,7 +504,7 @@ export function InboxLive({
   const fetchTriggerLinks = useCallback(async () => {
     setLoadingLinks(true);
     try {
-      const res = await api<{ triggerLinks: TriggerLink[] }>(`/api/v1/studios/${studioId}/messaging/trigger-links`);
+      const res = await api<{ triggerLinks: TriggerLink[] }>(`/api/v1/studios/${studioId}/messaging/trigger-links`, { cache: 'no-store' });
       setTriggerLinks(res.triggerLinks);
     } catch (err) {
       console.error(err);
@@ -258,7 +516,7 @@ export function InboxLive({
   const fetchJobs = useCallback(async () => {
     setLoadingJobs(true);
     try {
-      const res = await api<{ jobs: PendingJob[] }>(`/api/v1/studios/${studioId}/messaging/jobs`);
+      const res = await api<{ jobs: PendingJob[] }>(`/api/v1/studios/${studioId}/messaging/jobs`, { cache: 'no-store' });
       setJobs(res.jobs);
     } catch (err) {
       console.error(err);
@@ -305,10 +563,10 @@ export function InboxLive({
         const evt: SSEEvent = JSON.parse(e.data);
         if (evt.studioId !== studioId) return;
         refreshConversations();
-        if (evt.conversationId === selectedId) {
+        if (evt.conversationId === selectedIdRef.current) {
           refreshMessages(evt.conversationId);
         }
-        if (currentTab === 'automated_messages') {
+        if (currentTabRef.current === 'automated_messages') {
           fetchJobs();
         }
       } catch {
@@ -322,7 +580,7 @@ export function InboxLive({
     return () => {
       es.close();
     };
-  }, [studioId, selectedId, currentTab, refreshConversations, refreshMessages, fetchJobs]);
+  }, [studioId, refreshConversations, refreshMessages, fetchJobs]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -519,11 +777,14 @@ export function InboxLive({
     setActiveChannel(kind);
     setSelectedId(null);
     setMessages([]);
+    const p = new URLSearchParams(searchParams.toString());
+    p.set('channel', kind);
+    router.replace(`${pathname}?${p.toString()}`, { scroll: false });
   };
 
   useEffect(() => {
     refreshConversations();
-  }, [activeChannel, refreshConversations]);
+  }, [activeChannel, unrespondedOnly, refreshConversations]);
 
   // Handler calls for Templates
   async function handleCreateTemplate(e: React.FormEvent) {
@@ -560,6 +821,73 @@ export function InboxLive({
       fetchTemplates();
     } catch (err) {
       console.error('Failed to save template:', err);
+    }
+  }
+
+  const handleConversationAIToggle = useCallback((conversationId: string, enabled: boolean) => {
+    setConversations((prev) => prev.map((c) => (c.id === conversationId ? { ...c, aiEnabled: enabled } : c)));
+  }, []);
+
+  // Controls ONLY "continue AI after greeting" for future leads imported
+  // from the studio's external Google Sheet — does not touch any
+  // currently-open conversations. Nothing to save until a sheet is
+  // actually configured (the API requires a spreadsheetId).
+  const sheetConfigured = Boolean(sheetSettingsRaw && (sheetSettingsRaw.spreadsheetId as string | undefined));
+
+  async function toggleGlobalAI() {
+    if (globalAISaving || !sheetConfigured || !sheetSettingsRaw) return;
+    const next = !globalAI;
+    setGlobalAISaving(true);
+    setGlobalAI(next);
+    try {
+      // The save endpoint rejects unknown fields — only send exactly what
+      // it accepts, not the raw GET response (which also has id/studioId/
+      // createdAt/updatedAt).
+      const payload = {
+        spreadsheetId: sheetSettingsRaw.spreadsheetId,
+        tabName: sheetSettingsRaw.tabName,
+        nameColumn: sheetSettingsRaw.nameColumn,
+        firstNameColumn: sheetSettingsRaw.firstNameColumn,
+        lastNameColumn: sheetSettingsRaw.lastNameColumn,
+        emailColumn: sheetSettingsRaw.emailColumn,
+        phoneColumn: sheetSettingsRaw.phoneColumn,
+        sourceColumn: sheetSettingsRaw.sourceColumn,
+        notesColumn: sheetSettingsRaw.notesColumn,
+        dateColumn: sheetSettingsRaw.dateColumn,
+        hotLeadColumn: sheetSettingsRaw.hotLeadColumn,
+        trialPurchasedColumn: sheetSettingsRaw.trialPurchasedColumn,
+        continueAiAfterGreeting: next,
+        active: sheetSettingsRaw.active,
+      };
+      await api(`/api/v1/studios/${studioId}/leads/external-sheet-settings`, {
+        method: 'POST',
+        json: payload,
+      });
+      setSheetSettingsRaw((prev) => (prev ? { ...prev, continueAiAfterGreeting: next } : prev));
+    } catch (err) {
+      console.error('Failed to save continue-AI-after-greeting setting:', err);
+      setGlobalAI(!next);
+    } finally {
+      setGlobalAISaving(false);
+    }
+  }
+
+  async function handleDeleteSelectedConversations() {
+    if (selectedConvIds.length === 0) return;
+    if (!confirm(`Delete ${selectedConvIds.length} selected conversation(s)?`)) return;
+    const ids = selectedConvIds;
+    const prevConversations = conversations;
+    setConversations((prev) => prev.filter((c) => !ids.includes(c.id)));
+    setSelectedConvIds([]);
+    try {
+      await Promise.all(
+        ids.map((id) =>
+          api(`/api/v1/studios/${studioId}/messaging/conversations/${id}`, { method: 'DELETE' })
+        )
+      );
+    } catch (err) {
+      console.error('Failed to delete conversations:', err);
+      setConversations(prevConversations);
     }
   }
 
@@ -717,20 +1045,34 @@ export function InboxLive({
 
   return (
     <div
-      className="flex flex-col h-[calc(100vh-11rem)] overflow-hidden rounded-[22px] border border-violet-200/30 backdrop-blur-2xl dark:border-violet-500/10"
-      style={{
-        background: 'linear-gradient(135deg, rgba(255,255,255,0.22) 0%, rgba(237,233,254,0.18) 50%, rgba(219,234,254,0.18) 100%)',
-        boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.2), 0 8px 40px rgba(139,92,246,0.08)',
-      }}
+      className="flex flex-col h-[calc(100vh-3.5rem)] overflow-hidden bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-950"
     >
+      {mounted && (
+        <HeaderActions>
+          <select
+            value={activeChannel}
+            onChange={(e) => handleChannelSwitch(e.target.value as ChannelKind)}
+            className="rounded border border-zinc-200 bg-white px-2 py-1 text-[10px] font-black uppercase tracking-wider text-zinc-700 focus:outline-none dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 cursor-pointer shadow-sm"
+            suppressHydrationWarning
+          >
+            <option value="whatsapp_web">WhatsApp (QR / Web)</option>
+            <option value="whatsapp_meta">WhatsApp (Cloud API)</option>
+            <option value="instagram_meta">Instagram</option>
+            <option value="messenger_meta">Messenger</option>
+            <option value="sms">SMS</option>
+            <option value="telegram_mtproto">Telegram (QR)</option>
+            <option value="telegram">Telegram (Bot)</option>
+          </select>
+        </HeaderActions>
+      )}
       {/* ── Top Navigation Tabs ─────────────────── */}
-      <div className="flex items-center justify-between border-b border-violet-200/20 px-6 py-3.5 bg-white/20 backdrop-blur-md dark:border-violet-500/10 dark:bg-white/5 shrink-0 z-20">
-        <div className="flex gap-2">
+      <div className="flex items-center justify-between border-b border-zinc-200 bg-white px-3 sm:px-6 dark:border-zinc-800 dark:bg-zinc-950 shrink-0 z-20 overflow-x-auto no-scrollbar">
+        <div className="flex gap-4 sm:gap-6 shrink-0">
           {(
             [
               { id: 'conversations', label: 'Conversations' },
-              { id: 'automated_messages', label: 'Automated Messages' },
-              { id: 'snippets', label: 'Snippets (Templates)' },
+              { id: 'automated_messages', label: 'Manual Actions' },
+              { id: 'snippets', label: 'Snippets' },
               { id: 'trigger_links', label: 'Trigger Links' },
             ] as const
           ).map((t) => (
@@ -739,10 +1081,10 @@ export function InboxLive({
               type="button"
               onClick={() => setCurrentTab(t.id)}
               className={cn(
-                "px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wider transition-all duration-300",
+                "py-3 text-xs font-black uppercase tracking-wider transition-all border-b-2 whitespace-nowrap shrink-0",
                 currentTab === t.id
-                  ? "bg-gradient-to-r from-brand-500 to-violet-500 text-white shadow-md shadow-brand-500/20"
-                  : "text-zinc-500 hover:bg-white/40 hover:text-zinc-700 dark:text-zinc-400 dark:hover:bg-white/5"
+                  ? "border-brand-500 text-brand-500 dark:text-brand-400"
+                  : "border-transparent text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
               )}
             >
               {t.label}
@@ -755,51 +1097,213 @@ export function InboxLive({
       <div className="flex flex-1 min-h-0">
         {currentTab === 'conversations' && (
           <>
-            {/* Sidebar */}
+            {/* Sidebar — full-width list on mobile, hidden once a chat is
+                open there; always a fixed-width column alongside the chat
+                pane from sm upward. */}
             <aside
-              className="hidden w-80 shrink-0 flex-col border-r border-violet-200/25 dark:border-violet-500/10 sm:flex"
-              style={{ background: 'linear-gradient(180deg, rgba(237,233,254,0.25) 0%, rgba(219,234,254,0.15) 100%)' }}
+              className={cn(
+                "w-full shrink-0 flex-col border-r border-zinc-200 sm:flex sm:w-80 bg-[#f8f9fa] dark:border-zinc-800 dark:bg-zinc-900",
+                mobileChatOpen ? "hidden sm:flex" : "flex"
+              )}
             >
-              {/* Sidebar Header */}
-              <div className="flex h-14 items-center justify-between border-b border-violet-200/20 px-5 dark:border-violet-500/10">
-                <div className="flex items-center gap-2">
-                  <h2 className="text-sm font-black uppercase tracking-[0.15em] text-violet-600 dark:text-violet-400">Messages</h2>
+
+
+              {/* Google Sheet leads AI toggle */}
+              <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-zinc-200 dark:border-zinc-800">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <Bot className={cn('h-3.5 w-3.5 shrink-0', globalAI ? 'text-emerald-500' : 'text-zinc-400')} />
+                    <span className="text-[10px] font-black uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
+                      AI Auto-Reply (Sheet Leads)
+                    </span>
+                  </div>
+                  <p className="mt-0.5 text-[9px] font-semibold leading-snug text-zinc-400">
+                    {!sheetConfigured
+                      ? 'Configure a Google Sheet import in Settings to use this.'
+                      : globalAI
+                      ? 'New Google Sheet leads keep chatting with AI after their first greeting.'
+                      : 'New Google Sheet leads get only their first greeting — no AI follow-up.'}
+                  </p>
                 </div>
-                <div className="flex items-center gap-1.5 rounded-full bg-emerald-500/15 px-2.5 py-1 text-[10px] font-black uppercase tracking-widest text-emerald-600 dark:text-emerald-400">
-                  <span className="relative flex h-1.5 w-1.5">
-                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
-                    <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                <button
+                  onClick={toggleGlobalAI}
+                  disabled={globalAISaving || !sheetConfigured}
+                  title={!sheetConfigured
+                    ? 'Configure a Google Sheet import in Settings first'
+                    : globalAI
+                    ? 'Turn off: new sheet leads will only get the initial greeting, no AI follow-up'
+                    : 'Turn on: new sheet leads will keep chatting with AI after the greeting'}
+                  className={cn(
+                    'relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors duration-300 focus:outline-none disabled:opacity-50',
+                    globalAI ? 'bg-emerald-500' : 'bg-zinc-300 dark:bg-zinc-700',
+                  )}
+                >
+                  <span className={cn(
+                    'pointer-events-none flex h-4 w-4 items-center justify-center rounded-full bg-white shadow transition-transform duration-300',
+                    globalAI ? 'translate-x-4' : 'translate-x-0.5',
+                  )}>
+                    {globalAISaving
+                      ? <Loader2 className="h-2.5 w-2.5 animate-spin text-zinc-400" />
+                      : <Bot className={cn('h-2 w-2', globalAI ? 'text-emerald-600' : 'text-zinc-400')} />
+                    }
                   </span>
-                  Live
+                </button>
+              </div>
+
+              {/* Inbox Tabs (Unread, All, Recents, Starred) */}
+              <div className="px-3 pt-2 pb-0 border-b border-zinc-250 dark:border-zinc-800 bg-[#f8f9fa] dark:bg-zinc-900">
+                <div className="flex items-center justify-between gap-1">
+                  <button
+                    type="button"
+                    onClick={() => setInboxTab('all')}
+                    className={cn(
+                      "flex flex-col items-center gap-1.5 pb-2 flex-1 text-[10px] font-black uppercase tracking-wider transition-all border-b-2",
+                      inboxTab === 'all'
+                        ? "border-brand-500 text-brand-500 dark:text-brand-400"
+                        : "border-transparent text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"
+                    )}
+                  >
+                    <Inbox className="h-4 w-4" />
+                    All
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setInboxTab('unread')}
+                    className={cn(
+                      "flex flex-col items-center gap-1.5 pb-2 flex-1 text-[10px] font-black uppercase tracking-wider transition-all border-b-2",
+                      inboxTab === 'unread'
+                        ? "border-brand-500 text-brand-500 dark:text-brand-400"
+                        : "border-transparent text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"
+                    )}
+                  >
+                    <div className="relative">
+                      <Mail className="h-4 w-4" />
+                      {conversations.filter(c => c.unreadCount > 0).length > 0 && (
+                        <span className="absolute -right-2.5 -top-1.5 grid h-4 min-w-[16px] place-items-center rounded-full bg-brand-500 px-1 text-[8px] font-black text-white leading-none shadow-sm">
+                          {conversations.filter(c => c.unreadCount > 0).length}
+                        </span>
+                      )}
+                    </div>
+                    Unread
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setInboxTab('recents')}
+                    className={cn(
+                      "flex flex-col items-center gap-1.5 pb-2 flex-1 text-[10px] font-black uppercase tracking-wider transition-all border-b-2",
+                      inboxTab === 'recents'
+                        ? "border-brand-500 text-brand-500 dark:text-brand-400"
+                        : "border-transparent text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"
+                    )}
+                  >
+                    <Clock className="h-4 w-4" />
+                    Recents
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setInboxTab('starred')}
+                    className={cn(
+                      "flex flex-col items-center gap-1.5 pb-2 flex-1 text-[10px] font-black uppercase tracking-wider transition-all border-b-2",
+                      inboxTab === 'starred'
+                        ? "border-brand-500 text-brand-500 dark:text-brand-400"
+                        : "border-transparent text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"
+                    )}
+                  >
+                    <Star className="h-4 w-4" />
+                    Starred
+                  </button>
                 </div>
               </div>
 
-              {/* Channel Tabs */}
-              <div className="flex gap-1.5 px-4 py-3">
-                {mounted ? (
-                  (['whatsapp_meta', 'instagram_meta', 'messenger_meta', 'sms'] as const).map((kind) => (
+              {/* Select All and Filter Row */}
+              <div className="px-4 py-2 flex items-center justify-between border-b border-zinc-200 dark:border-zinc-800 bg-[#f8f9fa] dark:bg-zinc-900 shrink-0 z-10">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={conversations.length > 0 && selectedConvIds.length === conversations.length}
+                    onChange={(e) => {
+                      if (e.target.checked) {
+                        setSelectedConvIds(conversations.map((c) => c.id));
+                      } else {
+                        setSelectedConvIds([]);
+                      }
+                    }}
+                    className="rounded border-zinc-300 dark:border-zinc-700 bg-transparent text-brand-500 focus:ring-brand-500 h-3.5 w-3.5 cursor-pointer"
+                  />
+                  <span className="text-[10px] font-black uppercase tracking-wider text-zinc-400">
+                    {selectedConvIds.length > 0 ? `${selectedConvIds.length} Selected` : 'Select all'}
+                  </span>
+                </div>
+                {selectedConvIds.length > 0 ? (
+                  <div className="flex items-center gap-1.5 animate-in fade-in duration-200">
                     <button
-                      key={kind}
                       type="button"
-                      onClick={() => handleChannelSwitch(kind)}
+                      onClick={() => {
+                        setStarredIds((prev) => {
+                          const toStar = selectedConvIds.filter(id => !prev.includes(id));
+                          const next = toStar.length > 0
+                            ? [...prev, ...toStar]
+                            : prev.filter(id => !selectedConvIds.includes(id));
+                          try {
+                            localStorage.setItem('projectx_starred_conversations', JSON.stringify(next));
+                          } catch (err) {
+                            console.error('Failed to save starred conversations', err);
+                          }
+                          return next;
+                        });
+                        // Don't clear selection — user may want to unstar immediately
+                      }}
                       className={cn(
-                        "flex-1 py-2 px-1 rounded-xl text-[9px] font-black uppercase tracking-wider transition-all duration-300",
-                        activeChannel === kind
-                          ? "bg-gradient-to-r from-brand-500 to-violet-500 text-white shadow-lg shadow-brand-500/25"
-                          : "bg-white/30 text-zinc-500 hover:bg-white/50 hover:text-zinc-700 dark:bg-white/5 dark:text-zinc-400 dark:hover:bg-white/10"
+                        "p-1 rounded transition-colors",
+                        selectedConvIds.every(id => starredIds.includes(id))
+                          ? "text-amber-500 hover:text-zinc-400"
+                          : "text-zinc-400 hover:text-amber-500"
                       )}
-                      suppressHydrationWarning
+                      title={selectedConvIds.every(id => starredIds.includes(id)) ? "Unstar selected" : "Star selected"}
                     >
-                      {CHANNEL_BADGE[kind].label}
+                      <Star className={cn("h-3.5 w-3.5", selectedConvIds.every(id => starredIds.includes(id)) ? "fill-current" : "fill-none")} />
                     </button>
-                  ))
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteSelectedConversations()}
+                      className="p-1 text-zinc-400 hover:text-rose-500 rounded transition-colors"
+                      title="Delete selected"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedConvIds([])}
+                      className="p-1 text-zinc-400 hover:text-zinc-600 rounded transition-colors ml-1"
+                      title="Clear selection"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
                 ) : (
-                  <div className="flex-1 h-8 bg-white/20 animate-pulse rounded-xl dark:bg-white/5" />
+                  <button
+                    type="button"
+                    onClick={() => setUnrespondedOnly(!unrespondedOnly)}
+                    className={cn(
+                      "flex items-center gap-1 px-2.5 py-0.5 rounded text-[9px] font-extrabold uppercase tracking-wider transition-all border",
+                      unrespondedOnly
+                        ? "bg-rose-500 border-rose-500 text-white shadow-sm"
+                        : "bg-transparent border-zinc-200 text-zinc-500 hover:border-zinc-300 dark:border-zinc-700 dark:text-zinc-400"
+                    )}
+                  >
+                    <span className={cn("h-1 w-1 rounded-full", unrespondedOnly ? "bg-white animate-pulse" : "bg-rose-500")} />
+                    Awaiting Reply
+                  </button>
+                )}
+                {unrespondedOnly && !selectedConvIds.length && (
+                  <span className="text-[9px] font-semibold uppercase tracking-wider text-zinc-400">
+                    Showing all channels
+                  </span>
                 )}
               </div>
 
               {/* New Conversation Input */}
-              <div className="px-4 pb-3">
+              <div className="px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 bg-[#f8f9fa] dark:bg-zinc-900">
                 <form
                   onSubmit={(e) => {
                     e.preventDefault();
@@ -811,64 +1315,139 @@ export function InboxLive({
                     type="text"
                     value={newReceiverValue}
                     onChange={(e) => setNewReceiverValue(e.target.value)}
-                    placeholder={activeChannel === 'whatsapp_meta' || activeChannel === 'sms' ? "Phone number..." : "Messenger ID..."}
-                    className="w-full rounded-2xl border border-white/20 bg-white/30 py-2.5 pl-4 pr-12 text-xs font-medium text-zinc-900 placeholder:text-zinc-400 backdrop-blur-md focus:border-brand-500/40 focus:outline-none focus:ring-2 focus:ring-brand-500/15 dark:border-white/5 dark:bg-white/5 dark:text-zinc-100 dark:placeholder:text-zinc-500"
+                    placeholder={
+                      activeChannel === 'whatsapp_meta' || activeChannel === 'whatsapp_web' || activeChannel === 'sms'
+                        ? 'Search name/number, or start new...'
+                        : activeChannel === 'telegram' || activeChannel === 'telegram_mtproto'
+                        ? 'Search, or Telegram chat ID...'
+                        : 'Search, or Messenger ID...'
+                    }
+                    className="w-full rounded border border-zinc-200 bg-white py-1.5 pl-3 pr-10 text-xs font-semibold text-zinc-900 placeholder:text-zinc-400 focus:border-brand-500 focus:outline-none dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-500"
                     suppressHydrationWarning
                   />
                   <button
                     type="submit"
                     disabled={!newReceiverValue.trim() || creatingConversation}
-                    className="absolute right-1.5 top-1/2 -translate-y-1/2 grid h-8 w-8 place-items-center rounded-xl bg-gradient-to-br from-brand-500 to-violet-500 text-white shadow-md transition-all hover:scale-105 active:scale-95 disabled:opacity-0"
+                    className="absolute right-1 top-1/2 -translate-y-1/2 grid h-6.5 w-6.5 place-items-center rounded bg-brand-500 text-white transition-all hover:bg-brand-600 disabled:opacity-0"
                     suppressHydrationWarning
                   >
-                    <Send className="h-3.5 w-3.5" />
+                    <Send className="h-3 w-3" />
                   </button>
                 </form>
               </div>
 
-              {/* Conversation List */}
-              <div className="flex-1 overflow-y-auto px-2 pb-2">
+              {/* Conversation List — filtered live by the box above, matching
+                  against contact name and number (both the raw JID/value and
+                  its display-cleaned form), so typing a saved contact's name
+                  or a phone number narrows the list the same way it would in
+                  a normal chat app's search bar. Falls through to the New
+                  Conversation Input's existing "start a chat with this
+                  number" behavior on submit when nothing matches. */}
+              <div className="flex-1 overflow-y-auto no-scrollbar">
                 {mounted ? (
-                  <ul className="space-y-0.5">
-                    {conversations.map((c) => (
+                  <ul className="space-y-0">
+                    {conversations
+                      .filter((c) => {
+                        const query = newReceiverValue.trim().toLowerCase();
+                        if (!query) return true;
+                        const name = (c.contactDisplayName || '').toLowerCase();
+                        const val = (c.contactValue || '').toLowerCase();
+                        const cleanVal = displayContact(c.contactValue || '').toLowerCase();
+                        return name.includes(query) || val.includes(query) || cleanVal.includes(query);
+                      })
+                      .map((c) => (
                       <li key={c.id}>
-                        <button
-                          type="button"
+                        <div
+                          role="button"
+                          tabIndex={0}
                           onClick={() => setSelectedId(c.id)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault();
+                              setSelectedId(c.id);
+                            }
+                          }}
                           className={cn(
-                            'group relative flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left transition-all duration-300',
+                            'group relative flex w-full items-start gap-2.5 px-3 py-3 text-left transition-all duration-350 cursor-pointer border-l-4 focus:outline-none border-b border-zinc-200 dark:border-zinc-800',
                             selectedId === c.id
-                              ? 'bg-gradient-to-r from-brand-500 to-violet-500 text-white shadow-lg shadow-brand-500/20'
-                              : 'hover:bg-white/40 dark:hover:bg-white/5',
+                              ? 'border-brand-500 bg-sky-50 dark:bg-brand-950/20'
+                              : selectedConvIds.includes(c.id)
+                              ? 'border-teal-400 bg-teal-50/60 dark:bg-teal-900/20'
+                              : 'border-transparent bg-white dark:bg-zinc-950 hover:bg-zinc-50 dark:hover:bg-white/5',
                           )}
                           suppressHydrationWarning
                         >
+                          <input
+                            type="checkbox"
+                            checked={selectedConvIds.includes(c.id)}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={(e) => {
+                              if (e.target.checked) {
+                                setSelectedConvIds((prev) => [...prev, c.id]);
+                              } else {
+                                setSelectedConvIds((prev) => prev.filter((id) => id !== c.id));
+                              }
+                            }}
+                            className="mt-3 rounded border-zinc-300 dark:border-zinc-700 bg-transparent text-brand-500 focus:ring-brand-500 h-3.5 w-3.5 cursor-pointer shrink-0"
+                          />
                           <ChannelAvatar kind={c.channelKind} name={c.contactDisplayName || c.contactValue} active={selectedId === c.id} />
                           <div className="min-w-0 flex-1">
-                            <div className="flex items-center justify-between gap-2">
-                              <span className={cn('truncate text-xs font-bold', selectedId === c.id ? 'text-white' : 'text-zinc-900 dark:text-zinc-100')}>
-                                {c.contactDisplayName || c.contactValue}
+                            <div className="flex items-center justify-between gap-1.5">
+                              <span className="truncate text-xs font-black text-zinc-800 dark:text-zinc-100">
+                                {c.contactDisplayName || displayContact(c.contactValue)}
                               </span>
                               <span
-                                className={cn('shrink-0 text-[9px] font-bold uppercase tracking-wider', selectedId === c.id ? 'text-white/60' : 'text-zinc-400')}
+                                className="shrink-0 text-[9px] font-semibold text-zinc-400"
                                 suppressHydrationWarning
                               >
                                 {relativeTime(c.lastMessageAt)}
                               </span>
                             </div>
-                            <div className="mt-0.5 flex items-center gap-2">
-                              <p className={cn('min-w-0 flex-1 truncate text-[11px] font-medium', selectedId === c.id ? 'text-white/75' : 'text-zinc-500 dark:text-zinc-400')}>
-                                {c.lastMessageDirection === 'outbound' && <span className={selectedId === c.id ? 'text-white/50' : 'text-zinc-400'}>You: </span>}
-                                {c.lastMessagePreview}
-                              </p>
-                              {c.unreadCount > 0 && selectedId !== c.id && (
-                                <span className="grid h-5 min-w-5 shrink-0 place-items-center rounded-full bg-gradient-to-r from-brand-500 to-violet-500 px-1.5 text-[9px] font-black text-white shadow-md shadow-brand-500/30">
-                                  {c.unreadCount}
-                                </span>
-                              )}
+                            
+                            <p className="mt-0.5 truncate text-[11px] font-medium text-zinc-500 dark:text-zinc-400">
+                              {c.lastMessageDirection === 'outbound' && <span className="text-zinc-400">You: </span>}
+                              {c.lastMessagePreview}
+                            </p>
+
+                            <div className="mt-1.5 flex items-center justify-between">
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                {c.leadStatus && (
+                                  <span className={cn(
+                                    "px-1.5 py-0.5 rounded text-[8px] font-extrabold uppercase tracking-wider shrink-0",
+                                    getLeadStatusStyles(c.leadStatus, selectedId === c.id)
+                                  )}>
+                                    {getLeadStatusLabel(c.leadStatus)}
+                                  </span>
+                                )}
+                                {c.assignedTo && (
+                                  <span className="px-1.5 py-0.5 rounded text-[8px] font-bold uppercase bg-zinc-100 text-zinc-600 dark:bg-white/5 dark:text-zinc-400 shrink-0">
+                                    {c.assignedTo.split('@')[0]}
+                                  </span>
+                                )}
+                              </div>
+                              
+                              <div className="flex items-center gap-1.5">
+                                {c.unreadCount > 0 && (
+                                  <span className="grid h-4 min-w-[16px] place-items-center rounded-full bg-brand-500 px-1 text-[8px] font-black text-white">
+                                    {c.unreadCount}
+                                  </span>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={(e) => toggleStar(e, c.id)}
+                                  className={cn(
+                                    "p-0.5 rounded transition-all hover:scale-110 active:scale-90",
+                                    starredIds.includes(c.id)
+                                      ? "text-amber-500"
+                                      : "text-zinc-300 hover:text-zinc-500 dark:text-zinc-600 dark:hover:text-zinc-400"
+                                  )}
+                                >
+                                  <Star className={cn("h-3.5 w-3.5", starredIds.includes(c.id) ? "fill-current" : "fill-none")} />
+                                </button>
+                              </div>
                             </div>
                           </div>
-                        </button>
+                        </div>
                       </li>
                     ))}
                   </ul>
@@ -880,36 +1459,93 @@ export function InboxLive({
               </div>
             </aside>
 
-            {/* Main Chat Pane */}
-            <section className="flex min-w-0 flex-1 flex-col relative">
+            {/* Main Chat Pane — hidden on mobile until a conversation is
+                opened (back button below returns to the list); always
+                visible alongside the sidebar from sm upward. */}
+            <section className={cn("min-w-0 flex-1 flex-col relative sm:flex", mobileChatOpen ? "flex" : "hidden")}>
               {selected ? (
                 <>
-                  <header className="z-10 flex h-14 items-center gap-3 border-b border-white/10 bg-white/20 px-5 backdrop-blur-xl dark:border-white/5 dark:bg-white/5">
-                    <ChannelAvatar
-                      kind={selected.channelKind}
-                      name={selected.contactDisplayName || selected.contactValue}
-                    />
-                    <div className="min-w-0">
-                      <div className="truncate text-xs font-bold text-zinc-900 dark:text-zinc-100">
-                        {selected.contactDisplayName || selected.contactValue}
+                  <header className="z-10 flex h-14 items-center justify-between border-b border-zinc-200 bg-white px-5 dark:border-zinc-800 dark:bg-zinc-950 shrink-0">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <button
+                        type="button"
+                        onClick={() => setMobileChatOpen(false)}
+                        className="shrink-0 -ml-1 p-1.5 rounded-lg text-zinc-500 hover:bg-zinc-100 dark:hover:bg-white/10 sm:hidden"
+                        title="Back to conversations"
+                      >
+                        <ChevronLeft className="h-4 w-4" />
+                      </button>
+                    <div
+                      className="flex items-center gap-3 cursor-pointer select-none min-w-0"
+                      onClick={() => setShowDetailsPanel(!showDetailsPanel)}
+                      title="Toggle details panel"
+                    >
+                      <ChannelAvatar
+                        kind={selected.channelKind}
+                        name={selected.contactDisplayName || displayContact(selected.contactValue)}
+                        hideBadgeOnMobile
+                      />
+                      <div className="min-w-0">
+                        <div className="truncate text-xs font-black text-zinc-900 dark:text-zinc-100">
+                          {selected.contactDisplayName || displayContact(selected.contactValue)}
+                        </div>
+                        <div className="flex items-center gap-1.5 truncate text-[9px] font-bold uppercase tracking-[0.15em] text-zinc-400">
+                          <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                          {channelLabel(selected.channelKind)}{selected.contactDisplayName && selected.contactDisplayName !== displayContact(selected.contactValue) ? ` · ${displayContact(selected.contactValue)}` : ''}
+                        </div>
                       </div>
-                      <div className="flex items-center gap-1.5 truncate text-[9px] font-bold uppercase tracking-[0.15em] text-zinc-400">
-                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 shadow-sm shadow-emerald-500/50" />
-                        {channelLabel(selected.channelKind)} · {selected.contactValue}
-                      </div>
+                    </div>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      {selected.leadId && (
+                        <div className="relative mr-2 hidden sm:block">
+                          <select
+                            value={selected.assignedTo || ''}
+                            onChange={(e) => handleAssigneeChange(e.target.value)}
+                            className="appearance-none pl-2.5 pr-6 py-1 rounded border border-zinc-200 dark:border-zinc-800 text-[10px] font-bold text-zinc-600 dark:text-zinc-400 bg-white/5 hover:bg-white/10 transition-colors cursor-pointer"
+                            title="Assign Owner"
+                          >
+                            <option value="">Unassigned</option>
+                            {users.map((u) => (
+                              <option key={u.id} value={u.email}>
+                                {u.email.split('@')[0]}
+                              </option>
+                            ))}
+                            {selected.assignedTo && !users.some(u => u.email === selected.assignedTo) && (
+                              <option value={selected.assignedTo}>{selected.assignedTo.split('@')[0]}</option>
+                            )}
+                          </select>
+                          <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[6px] text-zinc-400 pointer-events-none">▼</span>
+                        </div>
+                      )}
+                      <button className="p-2 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors" title="Call contact">
+                        <Phone className="h-4 w-4" />
+                      </button>
+                      <button className="p-2 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors" title="Video call">
+                        <Video className="h-4 w-4" />
+                      </button>
+                      <button
+                        onClick={(e) => toggleStar(e, selected.id)}
+                        className={cn(
+                          "p-2 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-all",
+                          starredIds.includes(selected.id) ? "text-amber-500" : "text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"
+                        )}
+                        title={starredIds.includes(selected.id) ? "Unstar conversation" : "Star conversation"}
+                      >
+                        <Star className={cn("h-4 w-4", starredIds.includes(selected.id) ? "fill-current" : "fill-none")} />
+                      </button>
+                      <button className="p-2 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors" title="Tags">
+                        <Tag className="h-4 w-4" />
+                      </button>
+                      <button className="p-2 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors" title="Archive">
+                        <Archive className="h-4 w-4" />
+                      </button>
                     </div>
                   </header>
 
                   <div
-                    className="relative flex-1 overflow-y-auto px-5 py-6"
-                    style={{
-                      background: 'linear-gradient(160deg, rgba(255,255,255,0.08) 0%, rgba(237,233,254,0.06) 50%, rgba(219,234,254,0.08) 100%)',
-                    }}
+                    className="relative flex-1 overflow-y-auto no-scrollbar px-5 py-6 bg-[#f4f5f6] dark:bg-zinc-900/40"
                   >
-                    <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(rgba(139,92,246,0.04)_1px,transparent_1px)] [background-size:22px_22px] dark:bg-[radial-gradient(rgba(139,92,246,0.06)_1px,transparent_1px)]" />
-                    <div className="pointer-events-none absolute left-1/4 top-1/4 h-48 w-48 rounded-full bg-violet-400/10 blur-3xl" />
-                    <div className="pointer-events-none absolute bottom-1/4 right-1/4 h-40 w-40 rounded-full bg-sky-400/10 blur-3xl" />
-
                     <div className="relative">
                       {loadingMessages && messages.length === 0 ? (
                         <div className="grid h-full place-items-center py-20">
@@ -927,10 +1563,7 @@ export function InboxLive({
                   </div>
 
                   <footer
-                    className="z-10 border-t border-violet-200/20 p-4 backdrop-blur-xl dark:border-violet-500/10"
-                    style={{
-                      background: 'linear-gradient(to top, rgba(237,233,254,0.35) 0%, rgba(219,234,254,0.25) 100%)',
-                    }}
+                    className="z-10 border-t border-zinc-200 p-4 bg-white dark:border-zinc-800 dark:bg-zinc-950 shrink-0"
                   >
                     {/* Hidden file input */}
                     <input
@@ -1001,8 +1634,8 @@ export function InboxLive({
                             setVisibleLinksCount(4);
                           }}
                           className={cn(
-                            "flex h-12 w-12 items-center justify-center rounded-2xl border border-violet-200/40 bg-white/40 text-violet-600 hover:bg-white/60 hover:text-violet-700 transition-all dark:border-violet-500/20 dark:bg-white/5 dark:text-violet-400 dark:hover:bg-white/10",
-                            (showAttachmentMenu || showTemplatesPopover || showLinksPopover || attachedMediaUrl) && "bg-violet-500 text-white hover:bg-violet-600 dark:bg-violet-500 dark:text-white"
+                            "flex h-10 w-10 items-center justify-center rounded border border-zinc-200 bg-zinc-50 text-zinc-650 hover:bg-zinc-100 hover:text-zinc-700 transition-all dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800",
+                            (showAttachmentMenu || showTemplatesPopover || showLinksPopover || attachedMediaUrl) && "bg-brand-500 border-brand-500 text-white hover:bg-brand-600 dark:bg-brand-500 dark:text-white"
                           )}
                           title="Attach templates, links, or files"
                         >
@@ -1016,7 +1649,7 @@ export function InboxLive({
                         {/* Dropdowns relative to this Paperclip button container */}
                         {/* 1. Main Menu */}
                         {showAttachmentMenu && (
-                          <div className="absolute bottom-14 left-0 z-35 w-48 p-2 rounded-2xl border border-zinc-200 bg-white/95 backdrop-blur-md shadow-xl dark:border-neutral-800 dark:bg-neutral-900/95 space-y-1">
+                          <div className="absolute bottom-12 left-0 z-35 w-48 p-1.5 rounded border border-zinc-200 bg-white shadow-lg dark:border-zinc-800 dark:bg-zinc-900 space-y-0.5">
                             <button
                               type="button"
                               onClick={() => {
@@ -1025,7 +1658,7 @@ export function InboxLive({
                                 setTemplateSearchQuery('');
                                 setVisibleTemplatesCount(4);
                               }}
-                              className="flex items-center gap-2.5 w-full text-left px-3 py-2.5 rounded-xl text-xs font-bold text-zinc-700 hover:bg-violet-50 dark:text-zinc-300 dark:hover:bg-neutral-800 transition-colors"
+                              className="flex items-center gap-2.5 w-full text-left px-3 py-2 rounded text-xs font-bold text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-800 transition-colors"
                             >
                               <span className="font-semibold text-xs tracking-wider">{`{...}`}</span> Templates
                             </button>
@@ -1037,7 +1670,7 @@ export function InboxLive({
                                 setLinkSearchQuery('');
                                 setVisibleLinksCount(4);
                               }}
-                              className="flex items-center gap-2.5 w-full text-left px-3 py-2.5 rounded-xl text-xs font-bold text-zinc-700 hover:bg-violet-50 dark:text-zinc-300 dark:hover:bg-neutral-800 transition-colors"
+                              className="flex items-center gap-2.5 w-full text-left px-3 py-2 rounded text-xs font-bold text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-800 transition-colors"
                             >
                               <LinkIcon className="h-3.5 w-3.5" /> Tracked Link
                             </button>
@@ -1047,7 +1680,7 @@ export function InboxLive({
                                 fileInputRef.current?.click();
                                 setShowAttachmentMenu(false);
                               }}
-                              className="flex items-center gap-2.5 w-full text-left px-3 py-2.5 rounded-xl text-xs font-bold text-zinc-700 hover:bg-violet-50 dark:text-zinc-300 dark:hover:bg-neutral-800 transition-colors"
+                              className="flex items-center gap-2.5 w-full text-left px-3 py-2 rounded text-xs font-bold text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-800 transition-colors"
                             >
                               <ImageIcon className="h-3.5 w-3.5" /> Photo / File
                             </button>
@@ -1057,7 +1690,7 @@ export function InboxLive({
                                 insertAvailability();
                                 setShowAttachmentMenu(false);
                               }}
-                              className="flex items-center gap-2.5 w-full text-left px-3 py-2.5 rounded-xl text-xs font-bold text-zinc-700 hover:bg-violet-50 dark:text-zinc-300 dark:hover:bg-neutral-800 transition-colors"
+                              className="flex items-center gap-2.5 w-full text-left px-3 py-2 rounded text-xs font-bold text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-800 transition-colors"
                             >
                               <Calendar className="h-3.5 w-3.5" /> Availability
                             </button>
@@ -1073,9 +1706,9 @@ export function InboxLive({
                                 setVisibleTemplatesCount((prev) => prev + 4);
                               }
                             }}
-                            className="absolute bottom-14 left-0 z-35 w-64 max-h-48 overflow-y-auto p-2 rounded-2xl border border-zinc-200 bg-white shadow-xl dark:border-neutral-800 dark:bg-neutral-900 space-y-1"
+                            className="absolute bottom-12 left-0 z-35 w-64 max-h-48 overflow-y-auto p-1.5 rounded border border-zinc-200 bg-white shadow-lg dark:border-zinc-800 dark:bg-zinc-900 space-y-0.5"
                           >
-                            <div className="flex items-center gap-2 px-2 py-1 border-b border-zinc-100 dark:border-neutral-850 mb-1">
+                            <div className="flex items-center gap-2 px-2 py-1 border-b border-zinc-150 dark:border-zinc-800 mb-1">
                               <input
                                 type="text"
                                 placeholder="Search templates..."
@@ -1084,7 +1717,7 @@ export function InboxLive({
                                   setTemplateSearchQuery(e.target.value);
                                   setVisibleTemplatesCount(4);
                                 }}
-                                className="flex-1 bg-zinc-50 dark:bg-neutral-800 border border-zinc-250 dark:border-neutral-750 rounded-xl px-2.5 py-1 text-[11px] text-zinc-800 dark:text-zinc-200 placeholder-zinc-400 focus:outline-none focus:ring-1 focus:ring-violet-400/30"
+                                className="flex-1 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded px-2 py-0.5 text-[11px] text-zinc-800 dark:text-zinc-200 placeholder-zinc-400 focus:outline-none focus:ring-1 focus:ring-brand-500"
                                 autoFocus
                               />
                               <button 
@@ -1094,7 +1727,7 @@ export function InboxLive({
                                   setShowAttachmentMenu(true);
                                   setTemplateSearchQuery('');
                                 }}
-                                className="text-[10px] font-bold text-violet-500 hover:underline shrink-0"
+                                className="text-[10px] font-bold text-brand-500 hover:underline shrink-0"
                               >
                                 Back
                               </button>
@@ -1126,7 +1759,7 @@ export function InboxLive({
                                     }
                                     setShowTemplatesPopover(false);
                                   }}
-                                  className="w-full text-left p-2 rounded-xl text-xs font-semibold text-zinc-700 hover:bg-violet-50 dark:text-zinc-300 dark:hover:bg-neutral-800 truncate"
+                                  className="w-full text-left p-2 rounded text-xs font-semibold text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-800 truncate"
                                 >
                                   {t.name}
                                 </button>
@@ -1144,9 +1777,9 @@ export function InboxLive({
                                 setVisibleLinksCount((prev) => prev + 4);
                               }
                             }}
-                            className="absolute bottom-14 left-0 z-35 w-64 max-h-48 overflow-y-auto p-2 rounded-2xl border border-zinc-200 bg-white shadow-xl dark:border-neutral-800 dark:bg-neutral-900 space-y-1"
+                            className="absolute bottom-12 left-0 z-35 w-64 max-h-48 overflow-y-auto p-1.5 rounded border border-zinc-200 bg-white shadow-lg dark:border-zinc-800 dark:bg-zinc-900 space-y-0.5"
                           >
-                            <div className="flex items-center gap-2 px-2 py-1 border-b border-zinc-100 dark:border-neutral-850 mb-1">
+                            <div className="flex items-center gap-2 px-2 py-1 border-b border-zinc-150 dark:border-zinc-800 mb-1">
                               <input
                                 type="text"
                                 placeholder="Search links..."
@@ -1155,7 +1788,7 @@ export function InboxLive({
                                   setLinkSearchQuery(e.target.value);
                                   setVisibleLinksCount(4);
                                 }}
-                                className="flex-1 bg-zinc-50 dark:bg-neutral-800 border border-zinc-250 dark:border-neutral-750 rounded-xl px-2.5 py-1 text-[11px] text-zinc-800 dark:text-zinc-200 placeholder-zinc-400 focus:outline-none focus:ring-1 focus:ring-violet-400/30"
+                                className="flex-1 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded px-2 py-0.5 text-[11px] text-zinc-800 dark:text-zinc-200 placeholder-zinc-400 focus:outline-none focus:ring-1 focus:ring-brand-500"
                                 autoFocus
                               />
                               <button 
@@ -1165,7 +1798,7 @@ export function InboxLive({
                                   setShowAttachmentMenu(true);
                                   setLinkSearchQuery('');
                                 }}
-                                className="text-[10px] font-bold text-violet-500 hover:underline shrink-0"
+                                className="text-[10px] font-bold text-brand-500 hover:underline shrink-0"
                               >
                                 Back
                               </button>
@@ -1190,7 +1823,7 @@ export function InboxLive({
                                       setDraft((d) => d + (d ? ' ' : '') + trackedUrl);
                                       setShowLinksPopover(false);
                                     }}
-                                    className="w-full text-left p-2 rounded-xl text-xs font-semibold text-zinc-700 hover:bg-violet-50 dark:text-zinc-300 dark:hover:bg-neutral-800 truncate"
+                                    className="w-full text-left p-2 rounded text-xs font-semibold text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-800 truncate"
                                   >
                                     {l.name}
                                   </button>
@@ -1213,63 +1846,46 @@ export function InboxLive({
                           }}
                           rows={1}
                           placeholder="Type a message... (Enter to send)"
-                          className="block min-h-[48px] max-h-32 w-full resize-none rounded-2xl border border-violet-200/40 px-5 py-3 text-sm font-medium text-zinc-900 placeholder:text-violet-400/60 backdrop-blur-md focus:border-violet-400/50 focus:outline-none focus:ring-2 focus:ring-violet-400/20 dark:border-violet-500/20 dark:text-zinc-100 dark:placeholder:text-violet-300/30"
-                          style={{
-                            background: 'linear-gradient(135deg, rgba(255,255,255,0.7) 0%, rgba(245,243,255,0.65) 100%)',
-                            boxShadow: 'inset 0 1px 3px rgba(139,92,246,0.08), 0 2px 12px rgba(139,92,246,0.06)',
-                          }}
+                          className="block min-h-[40px] max-h-32 w-full resize-none rounded border border-zinc-200 bg-white px-4 py-2 text-sm font-semibold text-zinc-900 placeholder:text-zinc-400 focus:border-brand-500 focus:outline-none dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-500"
                           suppressHydrationWarning
                         />
                       </div>
                       <button
                         type="submit"
                         disabled={(!draft.trim() && !attachedMediaUrl.trim()) || sending || uploadingMedia}
-                        className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl text-white shadow-xl shadow-brand-500/30 transition-all hover:scale-105 hover:shadow-brand-500/40 active:scale-95 disabled:opacity-40 disabled:hover:scale-100"
-                        style={{ background: 'linear-gradient(135deg, #7c3aed 0%, #6d28d9 50%, #4f46e5 100%)' }}
+                        className="grid h-10 w-10 shrink-0 place-items-center rounded bg-brand-500 text-white transition-all hover:bg-brand-600 disabled:opacity-40"
                         suppressHydrationWarning
                       >
-                        <Send className="h-5 w-5" />
+                        <Send className="h-4.5 w-4.5" />
                       </button>
                     </form>
-                    <p className="mt-2 text-center text-[10px] font-semibold text-violet-400/50">Enter to send · Shift+Enter for new line</p>
+                    <p className="mt-1.5 text-center text-[10px] font-semibold text-zinc-400">Enter to send · Shift+Enter for new line</p>
                   </footer>
                 </>
               ) : (
                 /* Empty state */
-                <div
-                  className="grid flex-1 place-items-center px-6 text-center"
-                  style={{
-                    background: 'linear-gradient(160deg, rgba(255,255,255,0.08) 0%, rgba(237,233,254,0.06) 50%, rgba(219,234,254,0.08) 100%)',
-                  }}
-                >
-                  <div
-                    className="max-w-sm rounded-[28px] border border-violet-200/30 p-10 backdrop-blur-2xl dark:border-violet-500/10"
-                    style={{
-                      background: 'linear-gradient(135deg, rgba(255,255,255,0.5) 0%, rgba(245,243,255,0.4) 100%)',
-                      boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.3), 0 16px 60px rgba(139,92,246,0.12)',
-                    }}
-                  >
-                    <div className="relative mx-auto mb-6 grid h-20 w-20 place-items-center">
-                      <div className="absolute inset-0 rounded-3xl bg-gradient-to-br from-violet-400/30 to-blue-400/20 blur-lg" />
-                      <div className="relative grid h-20 w-20 place-items-center rounded-3xl bg-gradient-to-br from-brand-500 to-violet-600 text-white shadow-xl shadow-brand-500/25">
-                        <MessagesSquare className="h-9 w-9" />
+                <div className="grid flex-1 place-items-center px-6 text-center bg-transparent">
+                  <div className="max-w-sm border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 p-10 shadow-none">
+                    <div className="relative mx-auto mb-6 grid h-16 w-16 place-items-center">
+                      <div className="relative grid h-16 w-16 place-items-center rounded bg-brand-50 text-brand-500 dark:bg-brand-500/10 dark:text-brand-400">
+                        <MessagesSquare className="h-8 w-8" />
                       </div>
                     </div>
-                    <h3 className="text-lg font-black text-zinc-900 dark:text-white">Select a Conversation</h3>
-                    <p className="mt-2.5 text-xs font-semibold leading-relaxed text-zinc-500 dark:text-zinc-400">
+                    <h3 className="text-base font-black text-zinc-800 dark:text-zinc-100">Select a Conversation</h3>
+                    <p className="mt-2.5 text-xs font-semibold leading-relaxed text-zinc-500 dark:text-zinc-500">
                       Choose a chat from the sidebar, or use the input box to start a new conversation.
                     </p>
                     <div className="mt-6 flex flex-wrap justify-center gap-2">
-                      <div className="flex items-center gap-1.5 rounded-full bg-violet-50 px-3.5 py-1.5 text-[10px] font-black uppercase text-violet-600 dark:bg-violet-500/10 dark:text-violet-400">
+                      <div className="flex items-center gap-1.5 px-3 py-1 text-[10px] font-black uppercase border border-violet-200 dark:border-violet-800 text-violet-600 dark:text-violet-400">
                         <span className="h-1.5 w-1.5 rounded-full bg-violet-500" />WhatsApp
                       </div>
-                      <div className="flex items-center gap-1.5 rounded-full bg-pink-50 px-3.5 py-1.5 text-[10px] font-black uppercase text-pink-600 dark:bg-pink-500/10 dark:text-pink-400">
+                      <div className="flex items-center gap-1.5 px-3 py-1 text-[10px] font-black uppercase border border-pink-200 dark:border-pink-800 text-pink-600 dark:text-pink-400">
                         <span className="h-1.5 w-1.5 rounded-full bg-pink-500" />Instagram
                       </div>
-                      <div className="flex items-center gap-1.5 rounded-full bg-blue-50 px-3.5 py-1.5 text-[10px] font-black uppercase text-blue-600 dark:bg-blue-500/10 dark:text-blue-400">
+                      <div className="flex items-center gap-1.5 px-3 py-1 text-[10px] font-black uppercase border border-blue-200 dark:border-blue-800 text-blue-600 dark:text-blue-400">
                         <span className="h-1.5 w-1.5 rounded-full bg-blue-500" />Messenger
                       </div>
-                      <div className="flex items-center gap-1.5 rounded-full bg-sky-50 px-3.5 py-1.5 text-[10px] font-black uppercase text-sky-600 dark:bg-sky-500/10 dark:text-sky-400">
+                      <div className="flex items-center gap-1.5 px-3 py-1 text-[10px] font-black uppercase border border-sky-200 dark:border-sky-800 text-sky-600 dark:text-sky-400">
                         <span className="h-1.5 w-1.5 rounded-full bg-sky-500" />SMS
                       </div>
                     </div>
@@ -1277,6 +1893,16 @@ export function InboxLive({
                 </div>
               )}
             </section>
+
+            {selected && showDetailsPanel && (
+              <ContactDetailsPanel
+                studioId={studioId}
+                conversation={selected}
+                onClose={() => setShowDetailsPanel(false)}
+                onLeadUpdated={handleLeadUpdated}
+                onAIToggle={handleConversationAIToggle}
+              />
+            )}
           </>
         )}
 
@@ -1306,7 +1932,7 @@ export function InboxLive({
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 flex-1 min-h-0">
           {/* Creator/Edit Form */}
-          <div className="lg:col-span-1 p-5 rounded-[22px] border border-violet-200/20 bg-white/20 backdrop-blur-md dark:border-white/5 dark:bg-white/5 space-y-4 shadow-xl lg:overflow-y-auto lg:h-full">
+          <div className="lg:col-span-1 p-4 border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 space-y-4 overflow-y-auto no-scrollbar" style={{ maxHeight: 'calc(100vh - 10rem)' }}>
             <h4 className="text-xs font-black uppercase tracking-wider text-violet-600 dark:text-violet-400 border-b border-violet-200/20 pb-3 dark:border-white/5">
               {editingJobId ? "Edit Scheduled Message" : "Schedule Message"}
             </h4>
@@ -1337,7 +1963,7 @@ export function InboxLive({
                     onChange={(e) => setSearchRecipientQuery(e.target.value)}
                     className="w-full rounded-xl border border-white/20 bg-white/30 px-3 py-1.5 text-xs font-semibold text-zinc-900 placeholder:text-zinc-400 dark:border-white/5 dark:bg-zinc-800 dark:text-zinc-100 focus:outline-none"
                   />
-                  <div className="h-36 overflow-y-auto border border-violet-200/20 rounded-xl bg-white/10 dark:border-white/5 dark:bg-white/5 p-2 space-y-1.5">
+                  <div className="h-36 overflow-y-auto no-scrollbar border border-violet-200/20 rounded-xl bg-white/10 dark:border-white/5 dark:bg-white/5 p-2 space-y-1.5">
                     {conversations
                       .filter(c => {
                         const query = searchRecipientQuery.toLowerCase();
@@ -1362,8 +1988,8 @@ export function InboxLive({
                               className="rounded border-zinc-300 text-brand-600 focus:ring-brand-500"
                             />
                             <div className="flex-1 truncate">
-                              <div>{c.contactDisplayName || c.contactValue}</div>
-                              <div className="text-[9px] text-zinc-400">{c.contactValue}</div>
+                              <div>{c.contactDisplayName || displayContact(c.contactValue)}</div>
+                              <div className="text-[9px] text-zinc-400">{c.contactDisplayName && c.contactDisplayName !== displayContact(c.contactValue) ? displayContact(c.contactValue) : ''}</div>
                             </div>
                             <span className="text-[8px] font-bold px-1.5 py-0.5 rounded text-white" style={{ backgroundColor: CHANNEL_BADGE[c.channelKind]?.color || '#999' }}>
                               {CHANNEL_BADGE[c.channelKind]?.label || c.channelKind}
@@ -1547,7 +2173,7 @@ export function InboxLive({
                 setTabVisibleJobsCount(prev => prev + 5);
               }
             }}
-            className="lg:col-span-2 space-y-3 lg:overflow-y-auto lg:h-full lg:pr-2"
+            className="lg:col-span-2 space-y-3 lg:overflow-y-auto no-scrollbar lg:h-full lg:pr-2"
           >
             {loadingJobs ? (
               <div className="flex justify-center py-12">
@@ -1677,7 +2303,7 @@ export function InboxLive({
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 flex-1 min-h-0">
           {/* Creator Form */}
-          <div className="lg:col-span-1 p-5 rounded-[22px] border border-violet-200/20 bg-white/20 backdrop-blur-md dark:border-white/5 dark:bg-white/5 space-y-4 shadow-xl lg:overflow-y-auto lg:h-full">
+          <div className="lg:col-span-1 p-5 rounded-[22px] border border-violet-200/20 bg-white/20 backdrop-blur-md dark:border-white/5 dark:bg-white/5 space-y-4 shadow-xl lg:overflow-y-auto no-scrollbar h-fit">
             <div className="flex items-center justify-between border-b border-violet-200/20 pb-3 dark:border-white/5">
               <h4 className="text-xs font-black uppercase tracking-wider text-violet-600 dark:text-violet-400">
                 {editingTemplateId ? "Edit Template" : "Create Template"}
@@ -1848,7 +2474,7 @@ export function InboxLive({
                 setTabVisibleTemplatesCount(prev => prev + 5);
               }
             }}
-            className="lg:col-span-2 space-y-3 lg:overflow-y-auto lg:h-full lg:pr-2"
+            className="lg:col-span-2 space-y-3 lg:overflow-y-auto no-scrollbar lg:h-full lg:pr-2"
           >
             {loadingTemplates ? (
               <div className="flex justify-center py-12">
@@ -1994,7 +2620,7 @@ export function InboxLive({
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 flex-1 min-h-0">
           {/* Creator Form */}
-          <div className="lg:col-span-1 p-5 rounded-[22px] border border-violet-200/20 bg-white/20 backdrop-blur-md dark:border-white/5 dark:bg-white/5 space-y-4 shadow-xl lg:overflow-y-auto lg:h-full">
+          <div className="lg:col-span-1 p-5 rounded-[22px] border border-violet-200/20 bg-white/20 backdrop-blur-md dark:border-white/5 dark:bg-white/5 space-y-4 shadow-xl lg:overflow-y-auto no-scrollbar h-fit">
             <h4 className="text-xs font-black uppercase tracking-wider text-violet-600 dark:text-violet-400 border-b border-violet-200/20 pb-3 dark:border-white/5">
               {editingLinkId ? "Edit Link" : "Create Link"}
             </h4>
@@ -2054,7 +2680,7 @@ export function InboxLive({
                 setTabVisibleLinksCount(prev => prev + 5);
               }
             }}
-            className="lg:col-span-2 space-y-3 lg:overflow-y-auto lg:h-full lg:pr-2"
+            className="lg:col-span-2 space-y-3 lg:overflow-y-auto no-scrollbar lg:h-full lg:pr-2"
           >
             {loadingLinks ? (
               <div className="flex justify-center py-12">
@@ -2134,13 +2760,13 @@ export function InboxLive({
 
 // ────────────────────────────────────────────────────────────────
 
-function ChannelAvatar({ kind, name, active }: { kind: ChannelKind; name: string; active?: boolean }) {
+function ChannelAvatar({ kind, name, active, hideBadgeOnMobile }: { kind: ChannelKind; name: string; active?: boolean; hideBadgeOnMobile?: boolean }) {
   const ch = CHANNEL_BADGE[kind];
   return (
     <span className="relative shrink-0">
       <span
         className={cn(
-          "grid h-11 w-11 place-items-center rounded-2xl text-sm font-black text-white shadow-lg transition-transform group-hover:scale-105",
+          "grid h-11 w-11 place-items-center rounded-full text-sm font-black text-white shadow-lg transition-transform group-hover:scale-105",
           active ? "bg-white/25 backdrop-blur-md" : "ring-3 ring-white/30 dark:ring-white/10"
         )}
         style={!active ? { background: avatarColor(name) } : undefined}
@@ -2150,8 +2776,9 @@ function ChannelAvatar({ kind, name, active }: { kind: ChannelKind; name: string
       </span>
       <span
         className={cn(
-          "absolute -bottom-0.5 -right-0.5 grid h-5 w-5 place-items-center rounded-lg text-[9px] font-black text-white shadow-md",
-          active ? "ring-2 ring-brand-500/50" : "ring-2 ring-white/50 dark:ring-neutral-900/80"
+          "absolute -bottom-0.5 -right-0.5 grid h-5 w-5 place-items-center rounded-full text-[9px] font-black text-white shadow-md",
+          active ? "ring-2 ring-brand-500/50" : "ring-2 ring-white/50 dark:ring-neutral-900/80",
+          hideBadgeOnMobile && "hidden sm:grid"
         )}
         style={{ background: ch?.color || '#999' }}
         aria-label={ch?.label || kind}
@@ -2166,39 +2793,39 @@ function MessageBubble({ msg }: { msg: Message }) {
   const isOutbound = msg.direction === 'outbound';
   const sourceTag = sourceTagFor(msg.sourceKind);
   return (
-    <li className={cn('flex animate-in', isOutbound ? 'justify-end' : 'justify-start')}>
+    <li className={cn('flex flex-col gap-0.5 animate-in', isOutbound ? 'items-end' : 'items-start')}>
+      {/* Sender label */}
+      <span className="px-1 text-[9px] font-black uppercase tracking-wider text-zinc-400">
+        {isOutbound ? 'You' : 'Contact'}
+      </span>
       <div
         className={cn(
-          'relative max-w-[85%] px-4 py-2.5 text-xs shadow-lg transition-all duration-300 sm:max-w-[70%]',
+          'relative max-w-[85%] px-3 py-2 text-xs shadow-sm transition-all duration-200 sm:max-w-[70%] rounded-lg border',
           isOutbound
-            ? 'rounded-[20px] rounded-br-none bg-gradient-to-br from-brand-500 to-violet-500 text-white shadow-brand-500/15'
-            : 'rounded-[20px] rounded-bl-none border border-white/30 bg-white/50 text-zinc-900 backdrop-blur-xl dark:border-white/5 dark:bg-white/10 dark:text-zinc-100',
+            ? 'bg-slate-100 border-slate-300 text-slate-800 dark:bg-slate-800 dark:border-slate-600 dark:text-slate-100'
+            : 'bg-white border-zinc-200 text-zinc-800 dark:bg-zinc-900 dark:border-zinc-700 dark:text-zinc-100',
         )}
       >
         {sourceTag && (
-          <div className={cn('mb-1 text-[9px] font-black uppercase tracking-widest opacity-60')}>
+          <div className="mb-1 text-[9px] font-black uppercase tracking-widest opacity-50">
             {sourceTag}
           </div>
         )}
         <div className="whitespace-pre-wrap font-medium leading-relaxed">{msg.body}</div>
-        
+
         {msg.attachments && msg.attachments.length > 0 && msg.attachments[0] && (() => {
           const att = msg.attachments[0]!;
           const type = att.type || 'image';
           return (
-            <div className="mt-2 rounded-xl overflow-hidden border border-white/20">
+            <div className="mt-2 rounded overflow-hidden border border-zinc-200 dark:border-zinc-700">
               {type === 'video' ? (
-                <video
-                  src={att.url}
-                  controls
-                  className="max-h-52 w-full object-cover rounded-xl"
-                />
+                <video src={att.url} controls className="max-h-52 w-full object-cover rounded" />
               ) : type === 'document' ? (
                 <a
                   href={att.url}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="flex items-center gap-2 px-3 py-3 bg-white/20 dark:bg-white/10 rounded-xl text-[10px] font-bold hover:bg-white/30 transition-all"
+                  className="flex items-center gap-2 px-3 py-3 bg-zinc-100 dark:bg-zinc-800 rounded text-[10px] font-bold hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-all"
                 >
                   <span className="text-xl">📎</span>
                   <span className="truncate">{att.url?.split('/').pop()}</span>
@@ -2207,7 +2834,7 @@ function MessageBubble({ msg }: { msg: Message }) {
                 <img
                   src={att.url}
                   alt="Attached media"
-                  className="max-h-52 w-full object-cover cursor-pointer rounded-xl"
+                  className="max-h-52 w-full object-cover cursor-pointer rounded"
                   onClick={() => window.open(att.url, '_blank')}
                 />
               )}
@@ -2215,23 +2842,13 @@ function MessageBubble({ msg }: { msg: Message }) {
           );
         })()}
 
-        <div
-          className={cn(
-            'mt-1.5 flex items-center justify-end gap-1.5 text-[9px] font-bold',
-            isOutbound ? 'text-white/60' : 'text-zinc-400',
-          )}
-        >
+        <div className={cn(
+          'mt-1.5 flex items-center justify-end gap-1.5 text-[9px] font-bold',
+          isOutbound ? 'text-slate-400 dark:text-slate-400' : 'text-zinc-400',
+        )}>
           <span suppressHydrationWarning>{formatTime(msg.sentAt)}</span>
           {isOutbound && <StatusTick status={msg.status} />}
         </div>
-
-        {/* Tail */}
-        <div className={cn(
-          "absolute bottom-0 h-3 w-3",
-          isOutbound
-            ? "-right-0.5 bg-violet-500 [clip-path:polygon(0_0,0%_100%,100%_100%)]"
-            : "-left-0.5 bg-white/50 dark:bg-white/10 [clip-path:polygon(100%_0,0%_100%,100%_100%)]"
-        )} />
       </div>
     </li>
   );
@@ -2262,10 +2879,14 @@ function sourceTagFor(s: SourceKind): string | null {
 function channelLabel(k: ChannelKind): string {
   switch (k) {
     case 'whatsapp_meta':  return 'WhatsApp';
+    case 'whatsapp_web':   return 'WhatsApp';
     case 'instagram_meta': return 'Instagram';
     case 'messenger_meta': return 'Messenger';
     case 'x_dm':           return 'X DM';
     case 'sms':            return 'SMS';
+    case 'google_ads':     return 'Google Ads';
+    case 'telegram':       return 'Telegram';
+    case 'telegram_mtproto': return 'Telegram';
   }
 }
 

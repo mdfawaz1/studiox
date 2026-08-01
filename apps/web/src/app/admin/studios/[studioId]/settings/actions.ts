@@ -22,13 +22,24 @@ export async function updateStudioSettings(
   studioId: string,
   studioSlug: string,
   data: {
-    name: string;
-    brandColor: string;
-    logoUrl: string;
-    contactEmail: string;
-    active: boolean;
-    availabilitySlots?: any;
+    name?: string;
+    brandColor?: string;
+    logoUrl?: string;
+    contactEmail?: string;
+    contactPhone?: string;
+    active?: boolean;
+    managedBy1Hero?: boolean;
+    availabilitySlots?: { day: string; times: string[] }[];
     availabilityTimezone?: string;
+    geminiApiKey?: string;
+    groqApiKey?: string;
+    metaAppId?: string;
+    metaAppSecret?: string;
+    googleClientId?: string;
+    googleClientSecret?: string;
+    googleDeveloperToken?: string;
+    knowledgeBase?: string;
+    trialAmountSgd?: number;
   },
 ): Promise<UpdateStudioResult> {
   const cookieStore = await cookies();
@@ -154,6 +165,89 @@ export async function saveSheetsSettings(
     .join('; ');
 
   const res = await fetch(`${API_BASE}/api/v1/studios/${studioId}/leads/sheets-settings`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+    },
+    body: JSON.stringify(data),
+    cache: 'no-store',
+  });
+
+  type ErrBody = { error?: string; details?: Record<string, string> };
+  const body = (await res.json().catch(() => null)) as ErrBody | null;
+
+  if (!res.ok) {
+    return {
+      ok: false,
+      error: body?.error ?? `HTTP ${res.status}`,
+      details: body?.details,
+    };
+  }
+
+  revalidatePath(`/admin/studios/${studioId}/settings`);
+  return { ok: true };
+}
+
+export interface ExternalLeadsSheetSettingsData {
+  spreadsheetId: string;
+  tabName: string;
+  nameColumn: string;
+  firstNameColumn: string;
+  lastNameColumn: string;
+  emailColumn: string;
+  phoneColumn: string;
+  sourceColumn: string;
+  notesColumn: string;
+  dateColumn: string;
+  hotLeadColumn: string;
+  trialPurchasedColumn: string;
+  continueAiAfterGreeting: boolean;
+  active: boolean;
+}
+
+export interface ExternalLeadsSheetSettingsResult {
+  ok: boolean;
+  error?: string;
+  data?: ExternalLeadsSheetSettingsData;
+}
+
+export async function getExternalLeadsSheetSettings(studioId: string): Promise<ExternalLeadsSheetSettingsResult> {
+  const cookieStore = await cookies();
+  const cookieHeader = cookieStore
+    .getAll()
+    .map((c) => `${c.name}=${c.value}`)
+    .join('; ');
+
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/studios/${studioId}/leads/external-sheet-settings`, {
+      method: 'GET',
+      headers: {
+        ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+      },
+      cache: 'no-store',
+    });
+    if (!res.ok) {
+      return { ok: false, error: `HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    return { ok: true, data };
+  } catch (err: any) {
+    return { ok: false, error: err.message };
+  }
+}
+
+export async function saveExternalLeadsSheetSettings(
+  studioId: string,
+  data: ExternalLeadsSheetSettingsData
+): Promise<UpdateStudioResult> {
+  const cookieStore = await cookies();
+  const cookieHeader = cookieStore
+    .getAll()
+    .map((c) => `${c.name}=${c.value}`)
+    .join('; ');
+
+  const res = await fetch(`${API_BASE}/api/v1/studios/${studioId}/leads/external-sheet-settings`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',

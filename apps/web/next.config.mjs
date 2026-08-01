@@ -3,9 +3,13 @@ import { fileURLToPath } from 'node:url';
 
 const configDir = path.dirname(fileURLToPath(import.meta.url));
 
-/** @type {import('next').NextConfig} */
+/** @type {import('next).NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  devIndicators: {
+    appIsrStatus: false,
+    buildActivity: false,
+  },
 
   // Standalone output: Next.js writes a self-contained server + minimal
   // node_modules to .next/standalone. The Docker image ships only that,
@@ -13,6 +17,12 @@ const nextConfig = {
   output: 'standalone',
   // Tell Next where the workspace root is so it traces deps correctly.
   outputFileTracingRoot: path.join(configDir, '../..'),
+
+  serverExternalPackages: ['officeparser', 'pdfjs-dist'],
+
+  // Disable source maps in production for security
+  // (prevent frontend code exposure in DevTools)
+  productionBrowserSourceMaps: false,
 
   // Same-origin API: the browser always calls /api/* on whatever host it's
   // loaded from, and Next.js proxies it to the Go backend. In dev that's
@@ -29,6 +39,29 @@ const nextConfig = {
       {
         source: '/uploads/:path*',
         destination: `${apiBase}/uploads/:path*`,
+      },
+    ];
+  },
+
+  // Security headers to prevent source map access
+  async headers() {
+    return [
+      {
+        source: '/:path*',
+        headers: [
+          {
+            key: 'X-Content-Type-Options',
+            value: 'nosniff',
+          },
+          {
+            key: 'X-Frame-Options',
+            value: 'DENY',
+          },
+          {
+            key: 'X-XSS-Protection',
+            value: '1; mode=block',
+          },
+        ],
       },
     ];
   },

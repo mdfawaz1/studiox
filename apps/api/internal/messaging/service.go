@@ -2,14 +2,24 @@ package messaging
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"mime"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/stripe/stripe-go/v78"
+	"github.com/stripe/stripe-go/v78/client"
 
 	"github.com/projectx/api/internal/leads"
 	"github.com/projectx/api/internal/messaging/channels"
@@ -21,10 +31,11 @@ type Service struct {
 	repo              *Repo
 	bus               Bus
 	publicFormBaseURL string
+	publicAPIBaseURL  string
 }
 
-func NewService(repo *Repo, bus Bus, publicFormBaseURL string) *Service {
-	return &Service{repo: repo, bus: bus, publicFormBaseURL: publicFormBaseURL}
+func NewService(repo *Repo, bus Bus, publicFormBaseURL, publicAPIBaseURL string) *Service {
+	return &Service{repo: repo, bus: bus, publicFormBaseURL: publicFormBaseURL, publicAPIBaseURL: publicAPIBaseURL}
 }
 
 // ============================================================
@@ -59,12 +70,133 @@ func (s *Service) ConnectMetaChannel(ctx context.Context, studioID uuid.UUID, in
 	})
 }
 
+type ConnectTwilioInput struct {
+	AccountSID  string
+	AuthToken   string
+	PhoneNumber string
+}
+
+func (s *Service) ConnectTwilioChannel(ctx context.Context, studioID uuid.UUID, in ConnectTwilioInput) (*ChannelAccount, error) {
+	in.AccountSID = strings.TrimSpace(in.AccountSID)
+	in.AuthToken = strings.TrimSpace(in.AuthToken)
+	in.PhoneNumber = strings.TrimSpace(in.PhoneNumber)
+
+	if in.AccountSID == "" || in.AuthToken == "" || in.PhoneNumber == "" {
+		return nil, errors.New("account SID, auth token, and phone number are required")
+	}
+
+	return s.repo.CreateChannel(ctx, CreateChannelInput{
+		StudioID:      studioID,
+		Kind:          KindSMS,
+		BSP:           "twilio",
+		ExternalID:    in.PhoneNumber,
+		ParentID:      in.AccountSID,
+		DisplayHandle: in.PhoneNumber,
+		AccessToken:   in.AccountSID + ":" + in.AuthToken,
+	})
+}
+
+type ConnectTelegramInput struct {
+	BotToken string
+}
+
+// ConnectTelegramChannel validates the bot token against Telegram's getMe,
+// registers our webhook via setWebhook with a freshly generated per-channel
+// secret, and stores both the token and that secret (as JSON, see
+// channels.TelegramCredentials) encrypted in one column.
+func (s *Service) ConnectTelegramChannel(ctx context.Context, studioID uuid.UUID, in ConnectTelegramInput) (*ChannelAccount, error) {
+	in.BotToken = strings.TrimSpace(in.BotToken)
+	if in.BotToken == "" {
+		return nil, errors.New("bot token is required")
+	}
+
+	info, err := channels.TelegramGetMe(ctx, nil, in.BotToken)
+	if err != nil {
+		if errors.Is(err, channels.ErrInvalidCredentials) {
+			return nil, errors.New("invalid bot token")
+		}
+		return nil, fmt.Errorf("verify bot token: %w", err)
+	}
+
+	webhookSecret, err := randomHex(32)
+	if err != nil {
+		return nil, fmt.Errorf("generate webhook secret: %w", err)
+	}
+	webhookURL := strings.TrimRight(s.publicAPIBaseURL, "/") + "/api/v1/webhooks/telegram/" + fmt.Sprintf("%d", info.ID)
+
+	if err := channels.TelegramSetWebhook(ctx, nil, in.BotToken, webhookURL, webhookSecret); err != nil {
+		return nil, fmt.Errorf("register telegram webhook: %w", err)
+	}
+
+	creds, err := json.Marshal(channels.TelegramCredentials{
+		BotToken:      in.BotToken,
+		WebhookSecret: webhookSecret,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal credentials: %w", err)
+	}
+
+	displayHandle := info.Username
+	if displayHandle != "" {
+		displayHandle = "@" + displayHandle
+	} else {
+		displayHandle = fmt.Sprintf("bot-%d", info.ID)
+	}
+
+	return s.repo.CreateChannel(ctx, CreateChannelInput{
+		StudioID:      studioID,
+		Kind:          KindTelegram,
+		BSP:           "telegram",
+		ExternalID:    fmt.Sprintf("%d", info.ID),
+		DisplayHandle: displayHandle,
+		AccessToken:   string(creds),
+	})
+}
+
 func (s *Service) ListChannels(ctx context.Context, studioID uuid.UUID) ([]ChannelAccount, error) {
 	return s.repo.ListChannels(ctx, studioID)
 }
 
 func (s *Service) DisconnectChannel(ctx context.Context, studioID, id uuid.UUID) error {
-	return s.repo.DisconnectChannel(ctx, studioID, id)
+	// Look up the channel's kind before disconnecting so we know whether it
+	// needs a follow-up call to log out an external session (WhatsApp Web).
+	// Uses the token-free lookup so a corrupted/unrotated access_token_enc
+	// can't silently suppress the wa-web logout.
+	kind, lookupErr := s.repo.GetChannelKind(ctx, studioID, id)
+
+	if err := s.repo.DisconnectChannel(ctx, studioID, id); err != nil {
+		return err
+	}
+
+	// A DB-only disconnect leaves the wa-web Node service's WhatsApp Web
+	// session logged in — it would keep receiving messages against a channel
+	// Postgres now considers disconnected. Tell wa-web to drop the session too.
+	if lookupErr == nil && kind == KindWhatsAppWeb {
+		notifyWAWebDisconnect(ctx, studioID)
+	}
+	// Same reasoning for a QR-linked Telegram session — tell tg-web to log
+	// it out rather than leaving it live against a disconnected channel.
+	if lookupErr == nil && kind == KindTelegramMTProto {
+		notifyTGWebDisconnect(ctx, studioID)
+	}
+	return nil
+}
+
+// notifyWAWebDisconnect tells the wa-web Node service to log out a studio's
+// QR-linked WhatsApp Web session. Best-effort: the channel is already marked
+// disconnected in Postgres regardless of whether wa-web is reachable.
+func notifyWAWebDisconnect(ctx context.Context, studioID uuid.UUID) {
+	url := fmt.Sprintf("%s/sessions/%s/disconnect", waWebServiceURL(), studioID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("x-internal-key", waWebInternalKey())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return
+	}
+	_ = resp.Body.Close()
 }
 
 func (s *Service) UpdateChannel(ctx context.Context, studioID, id uuid.UUID, externalID, parentID, displayHandle, accessToken string) (*ChannelAccount, error) {
@@ -216,6 +348,99 @@ func (s *Service) HandleInboundWhatsAppMessage(ctx context.Context,
 		return err
 	}
 
+	// Link identity and conversation to lead (or auto-create lead for walk-in/direct messages)
+	var activeLeadID *uuid.UUID
+	if identity.LeadID != nil {
+		activeLeadID = identity.LeadID
+	} else if conv.LeadID != nil {
+		activeLeadID = conv.LeadID
+	}
+
+	if activeLeadID == nil {
+		var leadID uuid.UUID
+		// Search for an existing lead with this phone number in this studio (using clean digits)
+		sanitizedFrom := cleanPhoneNumber(msg.From)
+		err = tx.QueryRow(ctx, `
+			SELECT id FROM leads 
+			WHERE studio_id = $1 AND (
+				regexp_replace(phone, '\D', '', 'g') = $2 
+				OR regexp_replace(phone, '\D', '', 'g') = $3
+			)
+			LIMIT 1
+		`, channel.StudioID, msg.From, sanitizedFrom).Scan(&leadID)
+
+		if err != nil && errors.Is(err, pgx.ErrNoRows) {
+			// Fetch active campaign and its first fitness plan
+			var campaignID uuid.UUID
+			var fitnessPlans []string
+			errCampaign := tx.QueryRow(ctx, `
+				SELECT id, fitness_plans FROM campaigns 
+				WHERE studio_id = $1 AND active = true 
+				ORDER BY created_at DESC 
+				LIMIT 1
+			`, channel.StudioID).Scan(&campaignID, &fitnessPlans)
+			if errCampaign != nil {
+				_ = tx.QueryRow(ctx, `
+					SELECT id, fitness_plans FROM campaigns 
+					WHERE studio_id = $1 
+					LIMIT 1
+				`, channel.StudioID).Scan(&campaignID, &fitnessPlans)
+			}
+
+			defaultPlan := "Trial Class"
+			if len(fitnessPlans) > 0 {
+				defaultPlan = fitnessPlans[0]
+			}
+
+			// No existing lead, create one automatically
+			leadID = uuid.New()
+			fName := displayName
+			lName := ""
+			if displayName == "" {
+				displayName = msg.From
+				fName = msg.From
+			} else {
+				parts := strings.SplitN(displayName, " ", 2)
+				fName = parts[0]
+				if len(parts) > 1 {
+					lName = parts[1]
+				}
+			}
+			_, err = tx.Exec(ctx, `
+				INSERT INTO leads (id, studio_id, campaign_id, name, first_name, last_name, email, phone, fitness_plan, status, source, auto_contact_stage, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $6, '', $7, $8, 'contacted', 'whatsapp', 'awaiting_options', now(), now())
+			`, leadID, channel.StudioID, campaignID, displayName, fName, lName, msg.From, defaultPlan)
+			if err != nil {
+				return fmt.Errorf("auto-create lead: %w", err)
+			}
+		} else if err != nil {
+			return fmt.Errorf("lookup lead by phone: %w", err)
+		}
+		activeLeadID = &leadID
+	}
+
+	// Update identity and conversation with the lead ID if not set
+	if identity.LeadID == nil {
+		_, err = tx.Exec(ctx, `
+			UPDATE contact_identities SET lead_id = $2 WHERE id = $1
+		`, identity.ID, *activeLeadID)
+		if err != nil {
+			return fmt.Errorf("link identity to lead: %w", err)
+		}
+		identity.LeadID = activeLeadID
+	}
+
+	if conv.LeadID == nil {
+		_, err = tx.Exec(ctx, `
+			UPDATE conversations SET lead_id = $2 WHERE id = $1
+		`, conv.ID, *activeLeadID)
+		if err != nil {
+			return fmt.Errorf("link conversation to lead: %w", err)
+		}
+		leadIDStr := *activeLeadID
+		conv.LeadID = &leadIDStr
+	}
+
 	// 5. Insert the message (deduped by external_id).
 	body := ""
 	atts := []Attachment{}
@@ -233,22 +458,50 @@ func (s *Service) HandleInboundWhatsAppMessage(ctx context.Context,
 		body = msg.Button.Text
 	}
 	if msg.Image != nil {
-		atts = append(atts, Attachment{Type: "image", Mime: msg.Image.MimeType})
+		url, name := "", ""
+		if downloadedURL, downloadedName, err := downloadWhatsAppMedia(ctx, channel.AccessToken, msg.Image.ID, msg.Image.MimeType, msg.ID); err == nil {
+			url, name = downloadedURL, downloadedName
+			if strings.HasPrefix(url, "/") && s.publicFormBaseURL != "" {
+				url = strings.TrimRight(s.publicFormBaseURL, "/") + url
+			}
+		}
+		atts = append(atts, Attachment{Type: "image", URL: url, Mime: msg.Image.MimeType, Name: name})
 		if body == "" {
 			body = msg.Image.Caption
 		}
 	}
 	if msg.Video != nil {
-		atts = append(atts, Attachment{Type: "video", Mime: msg.Video.MimeType})
+		url, name := "", ""
+		if downloadedURL, downloadedName, err := downloadWhatsAppMedia(ctx, channel.AccessToken, msg.Video.ID, msg.Video.MimeType, msg.ID); err == nil {
+			url, name = downloadedURL, downloadedName
+			if strings.HasPrefix(url, "/") && s.publicFormBaseURL != "" {
+				url = strings.TrimRight(s.publicFormBaseURL, "/") + url
+			}
+		}
+		atts = append(atts, Attachment{Type: "video", URL: url, Mime: msg.Video.MimeType, Name: name})
 		if body == "" {
 			body = msg.Video.Caption
 		}
 	}
 	if msg.Audio != nil {
-		atts = append(atts, Attachment{Type: "audio", Mime: msg.Audio.MimeType})
+		url, name := "", ""
+		if downloadedURL, downloadedName, err := downloadWhatsAppMedia(ctx, channel.AccessToken, msg.Audio.ID, msg.Audio.MimeType, msg.ID); err == nil {
+			url, name = downloadedURL, downloadedName
+			if strings.HasPrefix(url, "/") && s.publicFormBaseURL != "" {
+				url = strings.TrimRight(s.publicFormBaseURL, "/") + url
+			}
+		}
+		atts = append(atts, Attachment{Type: "audio", URL: url, Mime: msg.Audio.MimeType, Name: name})
 	}
 	if msg.Document != nil {
-		atts = append(atts, Attachment{Type: "document", Mime: msg.Document.MimeType})
+		url, name := "", ""
+		if downloadedURL, downloadedName, err := downloadWhatsAppMedia(ctx, channel.AccessToken, msg.Document.ID, msg.Document.MimeType, msg.ID); err == nil {
+			url, name = downloadedURL, downloadedName
+			if strings.HasPrefix(url, "/") && s.publicFormBaseURL != "" {
+				url = strings.TrimRight(s.publicFormBaseURL, "/") + url
+			}
+		}
+		atts = append(atts, Attachment{Type: "document", URL: url, Mime: msg.Document.MimeType, Name: name})
 	}
 	if body == "" && len(atts) == 0 {
 		// Unknown type — skip but don't error to Meta.
@@ -278,178 +531,8 @@ func (s *Service) HandleInboundWhatsAppMessage(ctx context.Context,
 
 	// Deterministically update lead status based on button clicks / option selections.
 	// This runs inside the transaction and works even if the AI (Claude) worker is disabled.
-	if conv.LeadID != nil && stored != nil {
-		var leadName, leadStatus, leadNotes, autoContactStage, studioSlug, campaignSlug string
-		err = tx.QueryRow(ctx, `
-			SELECT l.name, l.status, l.notes, l.auto_contact_stage, s.slug, c.slug
-			FROM leads l
-			JOIN studios s ON s.id = l.studio_id
-			JOIN campaigns c ON c.id = l.campaign_id
-			WHERE l.studio_id = $1 AND l.id = $2
-		`, channel.StudioID, *conv.LeadID).Scan(&leadName, &leadStatus, &leadNotes, &autoContactStage, &studioSlug, &campaignSlug)
-
-		if err == nil {
-			first := firstName(leadName)
-			text := strings.ToLower(strings.TrimSpace(body))
-			targetStage := autoContactStage
-			targetStatus := leadStatus
-			targetNotes := leadNotes
-			var outboundBody string
-
-			isInterested := text == "1" || text == "interested" || (strings.Contains(text, "interested") && !strings.Contains(text, "not interested"))
-			isNotInterested := text == "2" || text == "not interested" || strings.Contains(text, "not interested") || strings.Contains(text, "not_interested")
-			isTrial := text == "1" || strings.Contains(text, "book a trial") || strings.Contains(text, "book trial") || strings.Contains(text, "trial")
-			isMember := text == "2" || strings.Contains(text, "become a member") || strings.Contains(text, "become member") || strings.Contains(text, "member")
-
-			if autoContactStage == "awaiting_interest" {
-				if isInterested && !isNotInterested {
-					targetStage = "awaiting_options"
-					targetStatus = "contacted"
-					outboundBody = fmt.Sprintf("Hi %s, great! Please select an option:\n1. Book a Trial\n2. Become a Member", first)
-				} else if isNotInterested {
-					targetStage = "awaiting_reason"
-					targetStatus = "dropped"
-					outboundBody = "We would like to know why are u not interested."
-				}
-			} else if autoContactStage == "awaiting_options" || (leadStatus == "trial_booked" && autoContactStage != "awaiting_trial_date" && autoContactStage != "awaiting_trial_time" && (isTrial || isMember)) {
-				if isTrial && !isMember {
-					targetStage = "awaiting_trial_date"
-					targetStatus = "trial_booked"
-					var days []string
-					t := time.Now()
-					for len(days) < 3 {
-						if t.Weekday() != time.Sunday {
-							days = append(days, t.Format("Mon, Jan 02"))
-						}
-						t = t.Add(24 * time.Hour)
-					}
-					outboundBody = fmt.Sprintf("Please select a date for your trial:\n1. %s\n2. %s\n3. %s", days[0], days[1], days[2])
-				} else if isMember && !isTrial {
-					targetStage = "completed"
-					targetStatus = "member"
-					outboundBody = "Our team would reach u ASAP."
-				}
-			} else if autoContactStage == "awaiting_trial_date" {
-				var days []string
-				t := time.Now()
-				for len(days) < 3 {
-					if t.Weekday() != time.Sunday {
-						days = append(days, t.Format("Mon, Jan 02"))
-					}
-					t = t.Add(24 * time.Hour)
-				}
-				selectedDate := ""
-				isOption1 := text == "1" || strings.Contains(text, "choice_1") || strings.Contains(text, strings.ToLower(days[0]))
-				isOption2 := text == "2" || strings.Contains(text, "choice_2") || strings.Contains(text, strings.ToLower(days[1]))
-				isOption3 := text == "3" || strings.Contains(text, "choice_3") || strings.Contains(text, strings.ToLower(days[2]))
-
-				if isOption1 {
-					selectedDate = days[0]
-				} else if isOption2 {
-					selectedDate = days[1]
-				} else if isOption3 {
-					selectedDate = days[2]
-				} else {
-					selectedDate = days[0]
-				}
-
-				targetNotes = strings.TrimSpace(targetNotes + "\n[Selected Trial Date]: " + selectedDate)
-				targetStage = "awaiting_trial_time"
-				outboundBody = "Please select a time slot:\n1. 09:00 AM\n2. 12:00 PM\n3. 04:00 PM"
-			} else if autoContactStage == "awaiting_trial_time" {
-				selectedTime := ""
-				isOption1 := text == "1" || strings.Contains(text, "choice_1") || strings.Contains(text, "09:00") || strings.Contains(text, "9:00")
-				isOption2 := text == "2" || strings.Contains(text, "choice_2") || strings.Contains(text, "12:00")
-				isOption3 := text == "3" || strings.Contains(text, "choice_3") || strings.Contains(text, "04:00") || strings.Contains(text, "4:00")
-
-				if isOption1 {
-					selectedTime = "09:00 AM"
-				} else if isOption2 {
-					selectedTime = "12:00 PM"
-				} else if isOption3 {
-					selectedTime = "04:00 PM"
-				} else {
-					selectedTime = "12:00 PM"
-				}
-
-				dateStr := ""
-				idx := strings.Index(targetNotes, "[Selected Trial Date]: ")
-				if idx != -1 {
-					dateStr = targetNotes[idx+len("[Selected Trial Date]: "):]
-					if end := strings.Index(dateStr, "\n"); end != -1 {
-						dateStr = dateStr[:end]
-					}
-					dateStr = strings.TrimSpace(dateStr)
-				}
-				if dateStr == "" {
-					dateStr = time.Now().Format("Mon, Jan 02")
-				}
-
-				targetNotes = strings.ReplaceAll(targetNotes, "[Selected Trial Date]: "+dateStr, "")
-				targetNotes = strings.TrimSpace(targetNotes + "\n[Selected Trial Slot]: " + dateStr + " " + selectedTime)
-				targetStage = "completed"
-				outboundBody = "Tnak you our team will reach u out "
-			} else if autoContactStage == "awaiting_reason" {
-				targetNotes = strings.TrimSpace(targetNotes + "\n[Dropped Reason]: " + body)
-				targetStage = "completed"
-				outboundBody = "Thank you for your time we would get back to u."
-			}
-
-			// Update the lead if anything changed
-			if targetStage != autoContactStage || targetStatus != leadStatus || targetNotes != leadNotes {
-				_, err = tx.Exec(ctx, `
-					UPDATE leads 
-					SET status = $3, notes = $4, auto_contact_stage = $5, updated_at = now()
-					WHERE studio_id = $1 AND id = $2
-				`, channel.StudioID, *conv.LeadID, targetStatus, targetNotes, targetStage)
-
-				// If outbound message needs to be sent
-				if err == nil && outboundBody != "" {
-					_, _ = tx.Exec(ctx, `
-						INSERT INTO outbound_jobs (studio_id, conversation_id, body, attachments,
-						                           source_kind, source_ref, scheduled_for, next_attempt_at)
-						VALUES ($1, $2, $3, '[]'::jsonb, 'automation', $4, $5, $5)
-					`, channel.StudioID, conv.ID, outboundBody, fmt.Sprintf("lead:%s:auto_reply:%s", conv.LeadID.String(), targetStage), time.Now().UTC())
-				}
-
-				// If they just transitioned to trial_booked, schedule the 1-day check-in follow-up
-				if err == nil && targetStatus == "trial_booked" && leadStatus != "trial_booked" {
-					followupBody := fmt.Sprintf("Hi %s, we hope you're enjoying your trial! Are you ready to take the next step and become a member? Please select an option:\n1. Book a Trial\n2. Become a Member", first)
-					_, _ = tx.Exec(ctx, `
-						INSERT INTO outbound_jobs (studio_id, conversation_id, body, attachments,
-						                           source_kind, source_ref, scheduled_for, next_attempt_at)
-						VALUES ($1, $2, $3, '[]'::jsonb, 'automation', $4, $5, $5)
-					`, channel.StudioID, conv.ID, followupBody, fmt.Sprintf("lead:%s:trial_followup:1day", conv.LeadID.String()), time.Now().UTC().Add(24*time.Hour))
-				}
-
-				// Enqueue Google Sheets update if status or notes changed
-				if err == nil && (targetStatus != leadStatus || targetNotes != leadNotes) {
-					var l leads.Lead
-					var ipText *string
-					row := tx.QueryRow(ctx, `
-						SELECT l.id, l.studio_id, l.campaign_id, l.name, COALESCE(l.first_name, ''), COALESCE(l.last_name, ''), l.email, l.phone, l.fitness_plan, l.goals,
-						       l.source, l.status, l.notes, l.contact_attempts, l.last_contacted_at, l.contact_made, l.hot_lead, l.trial_purchased, l.auto_contact_stage, l.referrer, l.user_agent, l.ip_address, l.created_at, l.updated_at,
-						       s.name, s.slug, c.name, c.slug
-						FROM leads l
-						JOIN campaigns c ON c.id = l.campaign_id
-						JOIN studios s ON s.id = l.studio_id
-						WHERE l.id = $1
-					`, *conv.LeadID)
-					scanErr := row.Scan(&l.ID, &l.StudioID, &l.CampaignID, &l.Name, &l.FirstName, &l.LastName, &l.Email, &l.Phone, &l.FitnessPlan, &l.Goals,
-						&l.Source, &l.Status, &l.Notes, &l.ContactAttempts, &l.LastContactedAt, &l.ContactMade, &l.HotLead, &l.TrialPurchased, &l.AutoContactStage, &l.Referrer, &l.UserAgent, &ipText, &l.CreatedAt, &l.UpdatedAt,
-						&l.StudioName, &l.StudioSlug, &l.CampaignName, &l.CampaignSlug)
-					if scanErr == nil {
-						payload, mErr := json.Marshal(l)
-						if mErr == nil {
-							_, _ = tx.Exec(ctx, `
-								INSERT INTO outbox (aggregate_type, aggregate_id, event_type, destination, payload)
-								VALUES ('lead', $1, 'lead.updated', 'google_sheets', $2)
-							`, l.ID, payload)
-						}
-					}
-				}
-			}
-		}
+	if err := s.processInboundLeadAutomation(ctx, tx, channel.StudioID, conv, stored, body); err != nil {
+		return fmt.Errorf("inbound lead automation: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -476,6 +559,95 @@ func (s *Service) HandleInboundWhatsAppMessage(ctx context.Context,
 	return nil
 }
 
+func downloadWhatsAppMedia(ctx context.Context, accessToken, mediaID, mimeType, messageID string) (string, string, error) {
+	if accessToken == "" || mediaID == "" {
+		return "", "", fmt.Errorf("missing media id or access token")
+	}
+
+	metaReq, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/%s", channels.MetaGraphBaseURL, mediaID), nil)
+	if err != nil {
+		return "", "", err
+	}
+	metaReq.Header.Set("Authorization", "Bearer "+accessToken)
+
+	metaResp, err := http.DefaultClient.Do(metaReq)
+	if err != nil {
+		return "", "", fmt.Errorf("media metadata request: %w", err)
+	}
+	defer metaResp.Body.Close()
+	metaBody, _ := io.ReadAll(metaResp.Body)
+	if metaResp.StatusCode >= 400 {
+		return "", "", fmt.Errorf("media metadata HTTP %d: %s", metaResp.StatusCode, string(metaBody))
+	}
+
+	var metaOK struct {
+		URL      string `json:"url"`
+		MimeType string `json:"mime_type"`
+	}
+	if err := json.Unmarshal(metaBody, &metaOK); err != nil {
+		return "", "", fmt.Errorf("decode media metadata: %w", err)
+	}
+	if metaOK.URL == "" {
+		return "", "", fmt.Errorf("empty media url")
+	}
+
+	mediaReq, err := http.NewRequestWithContext(ctx, http.MethodGet, metaOK.URL, nil)
+	if err != nil {
+		return "", "", err
+	}
+	mediaReq.Header.Set("Authorization", "Bearer "+accessToken)
+
+	mediaResp, err := http.DefaultClient.Do(mediaReq)
+	if err != nil {
+		return "", "", fmt.Errorf("download media: %w", err)
+	}
+	defer mediaResp.Body.Close()
+	if mediaResp.StatusCode >= 400 {
+		body, _ := io.ReadAll(mediaResp.Body)
+		return "", "", fmt.Errorf("media download HTTP %d: %s", mediaResp.StatusCode, string(body))
+	}
+
+	if err := os.MkdirAll("uploads", 0o755); err != nil {
+		return "", "", fmt.Errorf("create uploads dir: %w", err)
+	}
+
+	ext := extFromMimeType(mimeType)
+	if ext == "" {
+		ext = extFromMimeType(metaOK.MimeType)
+	}
+	if ext == "" {
+		if exts, _ := mime.ExtensionsByType(mediaResp.Header.Get("Content-Type")); len(exts) > 0 {
+			ext = exts[0]
+		}
+	}
+	if ext == "" {
+		ext = ".bin"
+	}
+
+	fileName := fmt.Sprintf("whatsapp-%s%s", messageID, ext)
+	outPath := filepath.Join("uploads", fileName)
+	outFile, err := os.Create(outPath)
+	if err != nil {
+		return "", "", fmt.Errorf("create media file: %w", err)
+	}
+	defer outFile.Close()
+	if _, err := io.Copy(outFile, mediaResp.Body); err != nil {
+		return "", "", fmt.Errorf("write media file: %w", err)
+	}
+
+	return "/uploads/" + fileName, fileName, nil
+}
+
+func extFromMimeType(mimeType string) string {
+	if mimeType == "" {
+		return ""
+	}
+	if exts, _ := mime.ExtensionsByType(mimeType); len(exts) > 0 {
+		return exts[0]
+	}
+	return ""
+}
+
 // HandleInboundMessaging processes a DM from Instagram or Facebook Messenger.
 func (s *Service) HandleInboundMessaging(ctx context.Context, kind ChannelKind, m channels.MetaWebhookMessaging) error {
 	if m.Message == nil || m.Message.Mid == "" {
@@ -483,12 +655,13 @@ func (s *Service) HandleInboundMessaging(ctx context.Context, kind ChannelKind, 
 	}
 
 	// 1. Resolve the channel account by the recipient's ID (the IG Account or FB Page PSID).
-	fmt.Printf("DEBUG: HandleInboundMessaging: kind=%s, recipientID=%s, senderID=%s\n", kind, m.Recipient.ID, m.Sender.ID)
 	channel, err := s.repo.GetChannelByExternalID(ctx, kind, m.Recipient.ID)
 	if err != nil {
-		// Log the mismatch so we can debug.
-		fmt.Printf("DEBUG: Meta message received for unknown channel: kind=%s, recipientID=%s\n", kind, m.Recipient.ID)
-		return nil
+		channel, err = s.repo.GetChannelByExternalID(ctx, kind, m.Sender.ID)
+		if err != nil {
+			slog.Warn("inbound message for unknown channel", "kind", kind, "recipientID", m.Recipient.ID, "senderID", m.Sender.ID)
+			return nil
+		}
 	}
 
 	tx, err := s.repo.Pool().BeginTx(ctx, pgx.TxOptions{})
@@ -514,6 +687,97 @@ func (s *Service) HandleInboundMessaging(ctx context.Context, kind ChannelKind, 
 		return err
 	}
 
+	// Link identity and conversation to lead (or auto-create lead for walk-in/direct messages)
+	var activeLeadID *uuid.UUID
+	if identity.LeadID != nil {
+		activeLeadID = identity.LeadID
+	} else if conv.LeadID != nil {
+		activeLeadID = conv.LeadID
+	}
+
+	if activeLeadID == nil {
+		var campaignID uuid.UUID
+		var fitnessPlans []string
+		errCampaign := tx.QueryRow(ctx, `
+			SELECT id, fitness_plans FROM campaigns 
+			WHERE studio_id = $1 AND active = true 
+			ORDER BY created_at DESC 
+			LIMIT 1
+		`, channel.StudioID).Scan(&campaignID, &fitnessPlans)
+		if errCampaign != nil {
+			_ = tx.QueryRow(ctx, `
+				SELECT id, fitness_plans FROM campaigns 
+				WHERE studio_id = $1 
+				LIMIT 1
+			`, channel.StudioID).Scan(&campaignID, &fitnessPlans)
+		}
+
+		defaultPlan := "Trial Class"
+		if len(fitnessPlans) > 0 {
+			defaultPlan = fitnessPlans[0]
+		}
+
+		// No existing lead, create one automatically
+		leadID := uuid.New()
+		displayName := "Messenger Guest"
+		if kind == KindInstagramMeta {
+			displayName = "Instagram Guest"
+		}
+		phonePlaceholder := fmt.Sprintf("meta-%s", m.Sender.ID)
+
+		_, err = tx.Exec(ctx, `
+			INSERT INTO leads (id, studio_id, campaign_id, name, first_name, last_name, email, phone, fitness_plan, status, source, auto_contact_stage, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, '', $7, $8, 'contacted', $9, 'awaiting_options', now(), now())
+		`, leadID, channel.StudioID, campaignID, displayName, displayName, "", phonePlaceholder, defaultPlan, string(kind))
+		if err != nil {
+			return fmt.Errorf("auto-create messenger lead: %w", err)
+		}
+		activeLeadID = &leadID
+	}
+
+	// Update identity and conversation with the lead ID if not set
+	if identity.LeadID == nil {
+		_, err = tx.Exec(ctx, `
+			UPDATE contact_identities SET lead_id = $2 WHERE id = $1
+		`, identity.ID, *activeLeadID)
+		if err != nil {
+			return fmt.Errorf("link identity to lead: %w", err)
+		}
+		identity.LeadID = activeLeadID
+	}
+
+	if conv.LeadID == nil {
+		_, err = tx.Exec(ctx, `
+			UPDATE conversations SET lead_id = $2 WHERE id = $1
+		`, conv.ID, *activeLeadID)
+		if err != nil {
+			return fmt.Errorf("link conversation to lead: %w", err)
+		}
+		leadIDStr := *activeLeadID
+		conv.LeadID = &leadIDStr
+	}
+
+	var atts []Attachment
+	for _, a := range m.Message.Attachments {
+		mimeType := ""
+		if a.Type == "image" {
+			mimeType = "image/jpeg"
+		} else if a.Type == "video" {
+			mimeType = "video/mp4"
+		} else if a.Type == "audio" {
+			mimeType = "audio/mpeg"
+		} else if a.Type == "file" || a.Type == "document" {
+			mimeType = "application/octet-stream"
+		}
+
+		atts = append(atts, Attachment{
+			Type: a.Type,
+			URL:  a.Payload.URL,
+			Mime: mimeType,
+			Name: "attachment",
+		})
+	}
+
 	// 4. Insert message.
 	stored, err := s.repo.InsertMessage(ctx, tx, CreateMessageInput{
 		ConversationID: conv.ID,
@@ -521,11 +785,22 @@ func (s *Service) HandleInboundMessaging(ctx context.Context, kind ChannelKind, 
 		Direction:      DirectionInbound,
 		SourceKind:     SourceCustomer,
 		Body:           m.Message.Text,
+		Attachments:    atts,
 		ExternalID:     m.Message.Mid,
 		SentAt:         time.Unix(m.Timestamp/1000, (m.Timestamp%1000)*1000000).UTC(),
 	})
 	if err != nil {
 		return err
+	}
+
+	inputText := m.Message.Text
+	if m.Message.QuickReply != nil && m.Message.QuickReply.Payload != "" {
+		inputText = m.Message.QuickReply.Payload
+	}
+
+	// Deterministically update lead status based on button clicks / option selections.
+	if err := s.processInboundLeadAutomation(ctx, tx, channel.StudioID, conv, stored, inputText); err != nil {
+		return fmt.Errorf("inbound lead automation: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -539,6 +814,952 @@ func (s *Service) HandleInboundMessaging(ctx context.Context, kind ChannelKind, 
 			ConversationID: conv.ID,
 			MessageID:      &stored.ID,
 		})
+	}
+	return nil
+}
+
+// HandleInboundSMS processes a DM from Twilio SMS.
+func (s *Service) HandleInboundSMS(ctx context.Context, messageSid, from, to, body string, attachments []Attachment) error {
+	// 1. Resolve the channel account by the recipient's phone number (Twilio To number).
+	channel, err := s.repo.GetChannelByExternalID(ctx, KindSMS, to)
+	if err != nil {
+		slog.Warn("SMS inbound for unknown channel", "to", to, "from", from)
+		return nil
+	}
+
+	tx, err := s.repo.Pool().BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// 2. Identity: use phone.
+	identity, err := s.repo.FindOrCreateIdentity(ctx, tx, channel.StudioID, IdentityPhone, from, from)
+	if err != nil {
+		return err
+	}
+
+	// 3. Conversation.
+	conv, err := s.repo.FindOrCreateConversation(ctx, tx, channel.StudioID, channel.ID, identity.ID, from)
+	if err != nil {
+		return err
+	}
+
+	// Link identity and conversation to lead (or auto-create lead for walk-in/direct messages)
+	var activeLeadID *uuid.UUID
+	if identity.LeadID != nil {
+		activeLeadID = identity.LeadID
+	} else if conv.LeadID != nil {
+		activeLeadID = conv.LeadID
+	}
+
+	if activeLeadID == nil {
+		var campaignID uuid.UUID
+		var fitnessPlans []string
+		errCampaign := tx.QueryRow(ctx, `
+			SELECT id, fitness_plans FROM campaigns 
+			WHERE studio_id = $1 AND active = true 
+			ORDER BY created_at DESC 
+			LIMIT 1
+		`, channel.StudioID).Scan(&campaignID, &fitnessPlans)
+		if errCampaign != nil {
+			_ = tx.QueryRow(ctx, `
+				SELECT id, fitness_plans FROM campaigns 
+				WHERE studio_id = $1 
+				LIMIT 1
+			`, channel.StudioID).Scan(&campaignID, &fitnessPlans)
+		}
+
+		defaultPlan := "Trial Class"
+		if len(fitnessPlans) > 0 {
+			defaultPlan = fitnessPlans[0]
+		}
+
+		// No existing lead, create one automatically
+		leadID := uuid.New()
+		displayName := from
+
+		_, err = tx.Exec(ctx, `
+			INSERT INTO leads (id, studio_id, campaign_id, name, first_name, last_name, email, phone, fitness_plan, status, source, auto_contact_stage, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, '', $7, $8, 'contacted', 'sms', 'awaiting_options', now(), now())
+		`, leadID, channel.StudioID, campaignID, displayName, displayName, "", from, defaultPlan)
+		if err != nil {
+			return fmt.Errorf("auto-create sms lead: %w", err)
+		}
+		activeLeadID = &leadID
+	}
+
+	// Update identity and conversation with the lead ID if not set
+	if identity.LeadID == nil {
+		_, err = tx.Exec(ctx, `
+			UPDATE contact_identities SET lead_id = $2 WHERE id = $1
+		`, identity.ID, *activeLeadID)
+		if err != nil {
+			return fmt.Errorf("link identity to lead: %w", err)
+		}
+		identity.LeadID = activeLeadID
+	}
+
+	if conv.LeadID == nil {
+		_, err = tx.Exec(ctx, `
+			UPDATE conversations SET lead_id = $2 WHERE id = $1
+		`, conv.ID, *activeLeadID)
+		if err != nil {
+			return fmt.Errorf("link conversation to lead: %w", err)
+		}
+		leadIDStr := *activeLeadID
+		conv.LeadID = &leadIDStr
+	}
+
+	// 4. Insert message.
+	stored, err := s.repo.InsertMessage(ctx, tx, CreateMessageInput{
+		ConversationID: conv.ID,
+		StudioID:       channel.StudioID,
+		Direction:      DirectionInbound,
+		SourceKind:     SourceCustomer,
+		Body:           body,
+		Attachments:    attachments,
+		ExternalID:     messageSid,
+		SentAt:         time.Now().UTC(),
+	})
+	if err != nil {
+		return err
+	}
+
+	// Deterministically update lead status based on button clicks / option selections.
+	if err := s.processInboundLeadAutomation(ctx, tx, channel.StudioID, conv, stored, body); err != nil {
+		return fmt.Errorf("inbound lead automation: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+
+	if stored != nil {
+		s.bus.Publish(ctx, Event{
+			Kind:           EvtMessageReceived,
+			StudioID:       channel.StudioID,
+			ConversationID: conv.ID,
+			MessageID:      &stored.ID,
+		})
+	}
+	return nil
+}
+
+// HandleInboundTelegramMessage processes a message from a studio's Telegram
+// bot. botExternalID is the bot's numeric Telegram user ID (public, used to
+// route webhooks — see webhook_telegram.go for why this isn't the bot
+// token). Follows the same identity → conversation → message → lead pattern
+// as HandleInboundSMS.
+func (s *Service) HandleInboundTelegramMessage(ctx context.Context, botExternalID string, upd channels.TelegramUpdate) error {
+	if upd.Message == nil {
+		return nil // non-message updates (edits, reactions, etc.) — ignore at L1
+	}
+	msg := upd.Message
+	chatID := fmt.Sprintf("%d", msg.Chat.ID)
+
+	// 1. Resolve the channel account by the bot's public ID.
+	channel, err := s.repo.GetChannelByExternalID(ctx, KindTelegram, botExternalID)
+	if err != nil {
+		slog.Warn("telegram inbound for unknown channel", "botExternalID", botExternalID)
+		return nil
+	}
+
+	tx, err := s.repo.Pool().BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// 2. Identity: the chat_id (stable, doesn't change even if the user
+	// renames their Telegram account).
+	displayName := strings.TrimSpace(fmt.Sprintf("%s %s", msgFromFirstName(msg), msgFromLastName(msg)))
+	identity, err := s.repo.FindOrCreateIdentity(ctx, tx, channel.StudioID, IdentityTelegramChatID, chatID, displayName)
+	if err != nil {
+		return err
+	}
+
+	// 3. Conversation.
+	conv, err := s.repo.FindOrCreateConversation(ctx, tx, channel.StudioID, channel.ID, identity.ID, chatID)
+	if err != nil {
+		return err
+	}
+
+	// Unlike other channels (default off), the Telegram bot's conversations
+	// start with AI auto-reply already on — this only fires the moment a
+	// conversation is first created (CreatedAt == UpdatedAt is
+	// FindOrCreateConversation's insert-vs-conflict tell, since the UPDATE
+	// branch always advances updated_at to a later now()), so a staff
+	// member manually turning AI off later is never silently re-enabled by
+	// the next inbound message.
+	if conv.CreatedAt.Equal(conv.UpdatedAt) && !conv.AIEnabled {
+		if _, err := tx.Exec(ctx, `UPDATE conversations SET ai_enabled = true WHERE id = $1`, conv.ID); err != nil {
+			return fmt.Errorf("enable default ai for new telegram conversation: %w", err)
+		}
+		conv.AIEnabled = true
+	}
+
+	// Link the conversation to a lead ONLY if one is already linked (e.g. a
+	// staff member manually assigned this Telegram contact to an existing
+	// lead via the UI). Deliberately never auto-creates a new lead here —
+	// unlike the QR channel (HandleInboundTGWeb), bot conversations are
+	// meant to stay in the Inbox only and never populate Pipeline/Leads.
+	// processInboundLeadAutomation below already no-ops when conv.LeadID
+	// is nil, so simply not creating one is enough to keep this channel
+	// out of both views.
+	var activeLeadID *uuid.UUID
+	if identity.LeadID != nil {
+		activeLeadID = identity.LeadID
+	} else if conv.LeadID != nil {
+		activeLeadID = conv.LeadID
+	}
+
+	if activeLeadID != nil {
+		if identity.LeadID == nil {
+			_, err = tx.Exec(ctx, `UPDATE contact_identities SET lead_id = $2 WHERE id = $1`, identity.ID, *activeLeadID)
+			if err != nil {
+				return fmt.Errorf("link identity to lead: %w", err)
+			}
+			identity.LeadID = activeLeadID
+		}
+
+		if conv.LeadID == nil {
+			_, err = tx.Exec(ctx, `UPDATE conversations SET lead_id = $2 WHERE id = $1`, conv.ID, *activeLeadID)
+			if err != nil {
+				return fmt.Errorf("link conversation to lead: %w", err)
+			}
+			leadIDStr := *activeLeadID
+			conv.LeadID = &leadIDStr
+		}
+	}
+
+	// 4. Media, if any — one attachment per message (Telegram sends photo
+	// albums as separate Update payloads, one message each, never combined).
+	body := msg.Text
+	var atts []Attachment
+	if fileID, attType, mimeHint, fileName := msg.Media(); fileID != "" {
+		var creds channels.TelegramCredentials
+		if err := json.Unmarshal([]byte(channel.AccessToken), &creds); err == nil && creds.BotToken != "" {
+			url, name, dlErr := channels.TelegramDownloadFile(ctx, nil, creds.BotToken, fileID, fileName, fmt.Sprintf("%d", msg.MessageID))
+			if dlErr != nil {
+				slog.Warn("telegram media download failed", "err", dlErr, "message_id", msg.MessageID)
+			} else {
+				if s.publicFormBaseURL != "" {
+					url = strings.TrimRight(s.publicFormBaseURL, "/") + url
+				}
+				atts = append(atts, Attachment{Type: attType, URL: url, Mime: mimeHint, Name: name})
+			}
+		}
+		if body == "" {
+			body = msg.Caption
+		}
+	}
+
+	// 5. Insert message. ExternalID dedupes retried webhook deliveries.
+	stored, err := s.repo.InsertMessage(ctx, tx, CreateMessageInput{
+		ConversationID: conv.ID,
+		StudioID:       channel.StudioID,
+		Direction:      DirectionInbound,
+		SourceKind:     SourceCustomer,
+		Body:           body,
+		Attachments:    atts,
+		ExternalID:     fmt.Sprintf("%d", msg.MessageID),
+		SentAt:         time.Unix(msg.Date, 0).UTC(),
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := s.processInboundLeadAutomation(ctx, tx, channel.StudioID, conv, stored, body); err != nil {
+		return fmt.Errorf("inbound lead automation: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+
+	if stored != nil {
+		s.bus.Publish(ctx, Event{
+			Kind:           EvtMessageReceived,
+			StudioID:       channel.StudioID,
+			ConversationID: conv.ID,
+			MessageID:      &stored.ID,
+		})
+	}
+	return nil
+}
+
+func msgFromFirstName(msg *channels.TelegramMessage) string {
+	if msg.From == nil {
+		return ""
+	}
+	return msg.From.FirstName
+}
+
+func msgFromLastName(msg *channels.TelegramMessage) string {
+	if msg.From == nil {
+		return ""
+	}
+	return msg.From.LastName
+}
+
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// HandleInboundWAWeb processes a message seen on a QR-linked WhatsApp Web
+// session's live socket — either a customer's reply (fromMe false) or a
+// message the studio typed directly into WhatsApp on the linked phone,
+// bypassing this platform entirely (fromMe true; see the messages.upsert
+// listener in sessions.js, which used to discard these outright). It follows
+// the same identity → conversation → message → lead pattern as
+// HandleInboundSMS, and the same inbound/outbound branching
+// handleWAWebBackfillOne already used for historical import.
+func (s *Service) HandleInboundWAWeb(ctx context.Context, studioID uuid.UUID, from, body, externalID string, fromMe bool, sentAt time.Time, pushName string) error {
+	// 1. Resolve the whatsapp_web channel for this studio.
+	channel, err := s.repo.GetActiveChannelByKind(ctx, studioID, KindWhatsAppWeb)
+	if err != nil || channel == nil {
+		return nil // session not yet connected — ignore
+	}
+
+	tx, err := s.repo.Pool().BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// 2. Identity stitching — strip @suffix for display, but also try to merge
+	// LID-based identities with phone-based ones for the same numeric ID.
+	//
+	// displayName comes from WhatsApp's own pushName on this message, never
+	// the raw phone/JID: FindOrCreateIdentity only writes display_name when
+	// the existing value is empty, so falling back to the phone number here
+	// would permanently lock it in as the display name even after a real
+	// name becomes known. pushName is the SENDER's own account name — for a
+	// fromMe message that's the studio's own WhatsApp profile name, not the
+	// contact's, so it must never be used here (confirmed in production:
+	// this locked a customer identity to the studio's own name on their
+	// first-ever, studio-sent campaign message). The wa-web side already
+	// guards this too; this is defense in depth, not the only guard.
+	displayName := ""
+	if !fromMe {
+		displayName = strings.TrimSpace(pushName)
+	}
+	numericPart := from
+	if idx := strings.Index(from, "@"); idx > 0 {
+		numericPart = from[:idx]
+	}
+	// If incoming is a phone (@c.us), check if we already have a LID identity
+	// with the same numeric prefix and reuse it (merge duplicate contacts).
+	identityKey := from
+	if strings.HasSuffix(from, "@c.us") {
+		var lidValue string
+		_ = tx.QueryRow(ctx, `
+			SELECT value FROM contact_identities
+			WHERE studio_id = $1 AND kind = 'phone' AND value LIKE $2
+			LIMIT 1
+		`, studioID, numericPart+"%@lid").Scan(&lidValue)
+		if lidValue != "" {
+			identityKey = lidValue // reuse existing LID-keyed identity
+		} else {
+			// No @lid identity either — check for a bare-digit identity (no
+			// @ suffix at all), the format used when a lead/conversation is
+			// created via other paths (external sheet import, Stripe
+			// checkout, manual lead creation) with the plain phone number.
+			// Without this, the same real contact splits across two
+			// identities/conversations — one keyed "<digits>@c.us", one
+			// keyed "<digits>" — each with independent ai_enabled/status
+			// state depending on which path created it first.
+			var bareValue string
+			_ = tx.QueryRow(ctx, `
+				SELECT value FROM contact_identities
+				WHERE studio_id = $1 AND kind = 'phone' AND value = $2
+				LIMIT 1
+			`, studioID, numericPart).Scan(&bareValue)
+			if bareValue != "" {
+				identityKey = bareValue // reuse existing bare-digit identity
+			}
+		}
+	}
+	identity, err := s.repo.FindOrCreateIdentity(ctx, tx, studioID, IdentityPhone, identityKey, displayName)
+	if err != nil {
+		return err
+	}
+
+	// 3. Conversation — keyed by identity key so LID and phone merge to same thread.
+	conv, err := s.repo.FindOrCreateConversation(ctx, tx, studioID, channel.ID, identity.ID, identityKey)
+	if err != nil {
+		return err
+	}
+
+	// 4. Auto-create a lead if none exists yet (same logic as SMS).
+	var activeLeadID *uuid.UUID
+	if identity.LeadID != nil {
+		activeLeadID = identity.LeadID
+	} else if conv.LeadID != nil {
+		activeLeadID = conv.LeadID
+	}
+
+	if activeLeadID == nil {
+		var leadID uuid.UUID
+		// Use the clean numeric part (no @c.us / @lid suffix) for human-readable fields.
+		cleanPhone := numericPart
+		// Search for an existing lead with this phone number in this studio
+		// (e.g. one imported from the Google Sheet) before minting a new one,
+		// so we inherit its real name/email instead of duplicating the contact.
+		lookupErr := tx.QueryRow(ctx, `
+			SELECT id FROM leads
+			WHERE studio_id = $1 AND (
+				regexp_replace(phone, '\D', '', 'g') = $2
+				OR regexp_replace(phone, '\D', '', 'g') = $3
+			)
+			LIMIT 1
+		`, studioID, from, cleanPhone).Scan(&leadID)
+
+		if lookupErr != nil && errors.Is(lookupErr, pgx.ErrNoRows) {
+			var campaignID uuid.UUID
+			var fitnessPlans []string
+			errCampaign := tx.QueryRow(ctx, `
+				SELECT id, fitness_plans FROM campaigns
+				WHERE studio_id = $1 AND active = true
+				ORDER BY created_at DESC LIMIT 1
+			`, studioID).Scan(&campaignID, &fitnessPlans)
+			if errCampaign != nil {
+				_ = tx.QueryRow(ctx, `
+					SELECT id, fitness_plans FROM campaigns WHERE studio_id = $1 LIMIT 1
+				`, studioID).Scan(&campaignID, &fitnessPlans)
+			}
+			if campaignID == uuid.Nil {
+				// No campaign exists for this studio at all yet. leads.campaign_id
+				// is NOT NULL, so there's no valid row we could insert — but that
+				// must not sink the whole inbound message (this whole function
+				// runs in one transaction, so returning an error here would have
+				// rolled back the conversation/message too, silently dropping a
+				// real customer message just because lead auto-creation isn't
+				// possible yet). Skip the lead; the conversation and message
+				// still get recorded below, and a lead can be created/linked
+				// once the studio has a campaign.
+				slog.Warn("no campaign exists for studio, skipping wa-web lead auto-create", "studio_id", studioID)
+			} else {
+				defaultPlan := "Trial Class"
+				if len(fitnessPlans) > 0 {
+					defaultPlan = fitnessPlans[0]
+				}
+				leadID = uuid.New()
+				// Prefer WhatsApp's own pushName over the bare phone digits when
+				// we already have one on this very first message, so the lead
+				// never needs a later placeholder-name fixup at all.
+				leadName := cleanPhone
+				if displayName != "" {
+					leadName = displayName
+				}
+				_, err = tx.Exec(ctx, `
+					INSERT INTO leads (id, studio_id, campaign_id, name, first_name, last_name,
+					                   email, phone, fitness_plan, status, source,
+					                   auto_contact_stage, created_at, updated_at)
+					VALUES ($1,$2,$3,$4,$5,'', '',$6,$7,'contacted','whatsapp_web','awaiting_options',now(),now())
+				`, leadID, studioID, campaignID, leadName, leadName, cleanPhone, defaultPlan)
+				if err != nil {
+					return fmt.Errorf("auto-create wa-web lead: %w", err)
+				}
+				activeLeadID = &leadID
+			}
+		} else if lookupErr != nil {
+			return fmt.Errorf("lookup wa-web lead by phone: %w", lookupErr)
+		} else {
+			activeLeadID = &leadID
+		}
+	}
+
+	if activeLeadID != nil {
+		if identity.LeadID == nil {
+			_, _ = tx.Exec(ctx, `UPDATE contact_identities SET lead_id=$2 WHERE id=$1`, identity.ID, *activeLeadID)
+			identity.LeadID = activeLeadID
+		}
+		if conv.LeadID == nil {
+			_, _ = tx.Exec(ctx, `UPDATE conversations SET lead_id=$2 WHERE id=$1`, conv.ID, *activeLeadID)
+			conv.LeadID = activeLeadID
+		}
+		// A lead that already existed (found by phone lookup above, or linked
+		// on a prior message) may still be carrying its auto-create placeholder
+		// name (the bare phone digits) if this is the first time we've heard a
+		// real pushName for it — fix that up now instead of leaving it stuck.
+		if err := s.repo.UpdateLeadNameIfPlaceholder(ctx, tx, *activeLeadID, displayName); err != nil {
+			return fmt.Errorf("sync wa-web lead name: %w", err)
+		}
+	}
+
+	// 5. Insert message. fromMe means this was typed directly into WhatsApp on
+	// the linked phone rather than sent through this platform — record it as
+	// outbound. `externalID` is the real WhatsApp message ID either way, so a
+	// fromMe message that's actually just the live echo of something our own
+	// outbound worker already sent (see waWebSender.SendText) naturally
+	// dedupes here instead of appearing a second time: InsertMessage returns
+	// a nil stored row on an external_id conflict.
+	direction := DirectionInbound
+	sourceKind := SourceCustomer
+	if fromMe {
+		direction = DirectionOutbound
+		sourceKind = SourceStudioUser
+	}
+	stored, err := s.repo.InsertMessage(ctx, tx, CreateMessageInput{
+		ConversationID: conv.ID,
+		StudioID:       studioID,
+		Direction:      direction,
+		SourceKind:     sourceKind,
+		Body:           body,
+		ExternalID:     externalID,
+		SentAt:         sentAt,
+	})
+	if err != nil {
+		return err
+	}
+
+	// The AI/automation pipeline reacts to genuine customer messages only —
+	// running it against our own outbound-from-phone message would be
+	// nonsensical (there's nothing to auto-reply to).
+	if !fromMe {
+		if err := s.processInboundLeadAutomation(ctx, tx, studioID, conv, stored, body); err != nil {
+			return fmt.Errorf("inbound lead automation: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+
+	if stored != nil {
+		evtKind := EvtMessageReceived
+		if fromMe {
+			evtKind = EvtMessageSent
+		}
+		s.bus.Publish(ctx, Event{
+			Kind:           evtKind,
+			StudioID:       studioID,
+			ConversationID: conv.ID,
+			MessageID:      &stored.ID,
+		})
+	}
+	return nil
+}
+
+// HandleInboundTGWeb processes a message seen on a QR-linked personal
+// Telegram account (tg-web). Follows the same identity → conversation →
+// message → lead pattern as HandleInboundWAWeb, but without WhatsApp's
+// @lid/@c.us JID-merging complexity — a Telegram chat ID is already a
+// single stable numeric identifier, so identityKey is just chatID directly.
+func (s *Service) HandleInboundTGWeb(ctx context.Context, studioID uuid.UUID, chatID, body, externalID string, fromMe bool, displayName string, attachments []Attachment, sentAt time.Time) error {
+	channel, err := s.repo.GetActiveChannelByKind(ctx, studioID, KindTelegramMTProto)
+	if err != nil || channel == nil {
+		return nil // session not yet connected — ignore
+	}
+
+	tx, err := s.repo.Pool().BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	identity, err := s.repo.FindOrCreateIdentity(ctx, tx, studioID, IdentityTelegramChatID, chatID, displayName)
+	if err != nil {
+		return err
+	}
+
+	conv, err := s.repo.FindOrCreateConversation(ctx, tx, studioID, channel.ID, identity.ID, chatID)
+	if err != nil {
+		return err
+	}
+
+	var activeLeadID *uuid.UUID
+	if identity.LeadID != nil {
+		activeLeadID = identity.LeadID
+	} else if conv.LeadID != nil {
+		activeLeadID = conv.LeadID
+	}
+
+	if activeLeadID == nil {
+		var campaignID uuid.UUID
+		var fitnessPlans []string
+		errCampaign := tx.QueryRow(ctx, `
+			SELECT id, fitness_plans FROM campaigns
+			WHERE studio_id = $1 AND active = true
+			ORDER BY created_at DESC LIMIT 1
+		`, studioID).Scan(&campaignID, &fitnessPlans)
+		if errCampaign != nil {
+			_ = tx.QueryRow(ctx, `
+				SELECT id, fitness_plans FROM campaigns WHERE studio_id = $1 LIMIT 1
+			`, studioID).Scan(&campaignID, &fitnessPlans)
+		}
+		if campaignID == uuid.Nil {
+			// No campaign for this studio yet — skip lead auto-create rather
+			// than fail the whole transaction (leads.campaign_id is NOT
+			// NULL). Matches HandleInboundWAWeb's same guard.
+			slog.Warn("no campaign exists for studio, skipping tg-web lead auto-create", "studio_id", studioID)
+		} else {
+			defaultPlan := "Trial Class"
+			if len(fitnessPlans) > 0 {
+				defaultPlan = fitnessPlans[0]
+			}
+			leadName := displayName
+			if leadName == "" {
+				leadName = chatID
+			}
+			leadID := uuid.New()
+			_, err = tx.Exec(ctx, `
+				INSERT INTO leads (id, studio_id, campaign_id, name, first_name, last_name,
+				                   email, phone, fitness_plan, status, source,
+				                   auto_contact_stage, created_at, updated_at)
+				VALUES ($1,$2,$3,$4,$5,'', '',$6,$7,'contacted','telegram_mtproto','awaiting_options',now(),now())
+			`, leadID, studioID, campaignID, leadName, leadName, chatID, defaultPlan)
+			if err != nil {
+				return fmt.Errorf("auto-create tg-web lead: %w", err)
+			}
+			activeLeadID = &leadID
+		}
+	}
+
+	if activeLeadID != nil {
+		if identity.LeadID == nil {
+			_, _ = tx.Exec(ctx, `UPDATE contact_identities SET lead_id=$2 WHERE id=$1`, identity.ID, *activeLeadID)
+			identity.LeadID = activeLeadID
+		}
+		if conv.LeadID == nil {
+			_, _ = tx.Exec(ctx, `UPDATE conversations SET lead_id=$2 WHERE id=$1`, conv.ID, *activeLeadID)
+			conv.LeadID = activeLeadID
+		}
+	}
+
+	// fromMe means this was typed directly into Telegram on the linked
+	// account rather than sent through this platform — record as outbound.
+	// A fromMe message that's actually the live echo of something our own
+	// outbound worker already sent (see tgWebSender.SendText) dedupes
+	// naturally on externalID via InsertMessage's ON CONFLICT DO NOTHING.
+	direction := DirectionInbound
+	sourceKind := SourceCustomer
+	if fromMe {
+		direction = DirectionOutbound
+		sourceKind = SourceStudioUser
+	}
+	stored, err := s.repo.InsertMessage(ctx, tx, CreateMessageInput{
+		ConversationID: conv.ID,
+		StudioID:       studioID,
+		Direction:      direction,
+		SourceKind:     sourceKind,
+		Body:           body,
+		Attachments:    attachments,
+		ExternalID:     externalID,
+		SentAt:         sentAt,
+	})
+	if err != nil {
+		return err
+	}
+
+	if !fromMe {
+		if err := s.processInboundLeadAutomation(ctx, tx, studioID, conv, stored, body); err != nil {
+			return fmt.Errorf("inbound lead automation: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+
+	if stored != nil {
+		evtKind := EvtMessageReceived
+		if fromMe {
+			evtKind = EvtMessageSent
+		}
+		s.bus.Publish(ctx, Event{
+			Kind:           evtKind,
+			StudioID:       studioID,
+			ConversationID: conv.ID,
+			MessageID:      &stored.ID,
+		})
+	}
+	return nil
+}
+
+// HandleInboundTGWebBackfill imports historical messages from a QR-linked
+// Telegram chat. Mirrors HandleInboundWAWebBackfill's contract: no AI/lead
+// automation, uses InsertMessageBackfill so unread counts/last-message
+// snapshots can't be corrupted, and never auto-creates a lead for a contact
+// that doesn't already have one.
+func (s *Service) HandleInboundTGWebBackfill(ctx context.Context, studioID uuid.UUID, msgs []BackfillMessage, contactDisplayName string) (int, error) {
+	if len(msgs) == 0 {
+		return 0, nil
+	}
+	channel, err := s.repo.GetActiveChannelByKind(ctx, studioID, KindTelegramMTProto)
+	if errors.Is(err, ErrNotFound) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("look up telegram_mtproto channel: %w", err)
+	}
+
+	imported := 0
+	for _, m := range msgs {
+		inserted, err := s.handleTGWebBackfillOne(ctx, studioID, channel.ID, m, contactDisplayName)
+		if err != nil {
+			return imported, err
+		}
+		if inserted {
+			imported++
+		}
+	}
+	return imported, nil
+}
+
+func (s *Service) handleTGWebBackfillOne(ctx context.Context, studioID, channelID uuid.UUID, m BackfillMessage, contactDisplayName string) (bool, error) {
+	tx, err := s.repo.Pool().BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	displayName := m.From
+	if contactDisplayName != "" {
+		displayName = contactDisplayName
+	}
+	identity, err := s.repo.FindOrCreateIdentity(ctx, tx, studioID, IdentityTelegramChatID, m.From, displayName)
+	if err != nil {
+		return false, err
+	}
+
+	conv, err := s.repo.FindOrCreateConversation(ctx, tx, studioID, channelID, identity.ID, m.From)
+	if err != nil {
+		return false, err
+	}
+
+	sentAt := time.Now().UTC()
+	if m.Timestamp > 0 {
+		sentAt = time.Unix(m.Timestamp, 0).UTC()
+	}
+	direction := DirectionInbound
+	sourceKind := SourceCustomer
+	if m.FromMe {
+		direction = DirectionOutbound
+		sourceKind = SourceStudioUser
+	}
+
+	stored, err := s.repo.InsertMessageBackfill(ctx, tx, CreateMessageInput{
+		ConversationID: conv.ID,
+		StudioID:       studioID,
+		Direction:      direction,
+		SourceKind:     sourceKind,
+		Body:           m.Text,
+		ExternalID:     m.MessageID,
+		SentAt:         sentAt,
+	})
+	if err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit: %w", err)
+	}
+	return stored != nil, nil
+}
+
+// BackfillMessage is one historical message pulled from a QR-linked chat
+// (WhatsApp Web or Telegram) after the session connects. fromMe
+// distinguishes messages the studio previously sent (outbound) from ones
+// the customer sent (inbound). For WA-Web, From is a WhatsApp JID; for
+// tg-web, it's a Telegram chat ID.
+type BackfillMessage struct {
+	From      string
+	Text      string
+	MessageID string
+	Timestamp int64
+	FromMe    bool
+}
+
+// HandleInboundWAWebBackfill imports historical WhatsApp Web messages for a
+// single chat. It reuses the same identity/conversation resolution as
+// HandleInboundWAWeb, but deliberately:
+//   - never calls processInboundLeadAutomation (a backfill must never trigger
+//     the AI auto-reply or lead-stage engine against old, already-resolved
+//     conversations),
+//   - uses InsertMessageBackfill so unread counts and last-message snapshots
+//     can't be corrupted by out-of-order or old data,
+//   - does not auto-create a lead for contacts that have none — old chats
+//     with no existing lead are still imported and visible in the inbox,
+//     but importing history alone should not spawn a phantom lead.
+//
+// contactDisplayName is the contact's real WhatsApp display name, pulled
+// from the same history-sync payload as the messages (see sessions.js's
+// messaging-history.set handler) — empty if WhatsApp didn't supply one for
+// this chat. Populates contact_identities.display_name, and — only if a lead
+// already exists for this contact and is still carrying its auto-create
+// placeholder name — fixes that name up too (see UpdateLeadNameIfPlaceholder).
+// Still never creates a lead itself, matching this function's existing
+// no-phantom-leads contract below.
+func (s *Service) HandleInboundWAWebBackfill(ctx context.Context, studioID uuid.UUID, msgs []BackfillMessage, contactDisplayName string) (int, error) {
+	if len(msgs) == 0 {
+		return 0, nil
+	}
+	channel, err := s.repo.GetActiveChannelByKind(ctx, studioID, KindWhatsAppWeb)
+	if errors.Is(err, ErrNotFound) {
+		return 0, nil // session not connected — nothing to attach history to
+	}
+	if err != nil {
+		return 0, fmt.Errorf("look up whatsapp_web channel: %w", err)
+	}
+
+	imported := 0
+	for _, m := range msgs {
+		inserted, err := s.handleWAWebBackfillOne(ctx, studioID, channel.ID, m, contactDisplayName)
+		if err != nil {
+			return imported, err
+		}
+		if inserted {
+			imported++
+		}
+	}
+	return imported, nil
+}
+
+// handleWAWebBackfillOne imports a single historical message and reports
+// whether a new row was actually inserted (false if it was already imported —
+// dedupe is keyed on the WhatsApp message ID).
+func (s *Service) handleWAWebBackfillOne(ctx context.Context, studioID, channelID uuid.UUID, m BackfillMessage, contactDisplayName string) (bool, error) {
+	tx, err := s.repo.Pool().BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// displayName is left blank when history sync didn't supply a real name
+	// for this chat (contactDisplayName == "") — NOT filled with the raw
+	// phone digits. FindOrCreateIdentity only ever writes display_name once
+	// (when it's currently empty), so defaulting to the phone number here
+	// would permanently lock the identity to showing a number, even once a
+	// real name arrives later via a live message's pushName or the
+	// contact-name-only sync.
+	displayName := contactDisplayName
+	numericPart := m.From
+	if idx := strings.Index(m.From, "@"); idx > 0 {
+		numericPart = m.From[:idx]
+	}
+	identityKey := m.From
+	if strings.HasSuffix(m.From, "@c.us") {
+		var lidValue string
+		_ = tx.QueryRow(ctx, `
+			SELECT value FROM contact_identities
+			WHERE studio_id = $1 AND kind = 'phone' AND value LIKE $2
+			LIMIT 1
+		`, studioID, numericPart+"%@lid").Scan(&lidValue)
+		if lidValue != "" {
+			identityKey = lidValue
+		}
+	}
+	identity, err := s.repo.FindOrCreateIdentity(ctx, tx, studioID, IdentityPhone, identityKey, displayName)
+	if err != nil {
+		return false, err
+	}
+
+	// Backfill never creates a lead (see the no-phantom-leads contract in the
+	// doc comment above), but if one already exists for this contact — e.g.
+	// imported from a Google Sheet, or created on an earlier live message —
+	// and it's still carrying the phone-digits placeholder name, this is a
+	// real learned name and should replace it.
+	if identity.LeadID != nil && contactDisplayName != "" {
+		if err := s.repo.UpdateLeadNameIfPlaceholder(ctx, tx, *identity.LeadID, contactDisplayName); err != nil {
+			return false, fmt.Errorf("sync wa-web backfill lead name: %w", err)
+		}
+	}
+
+	conv, err := s.repo.FindOrCreateConversation(ctx, tx, studioID, channelID, identity.ID, identityKey)
+	if err != nil {
+		return false, err
+	}
+
+	sentAt := time.Now().UTC()
+	if m.Timestamp > 0 {
+		sentAt = time.Unix(m.Timestamp, 0).UTC()
+	}
+	direction := DirectionInbound
+	sourceKind := SourceCustomer
+	if m.FromMe {
+		direction = DirectionOutbound
+		sourceKind = SourceStudioUser
+	}
+
+	stored, err := s.repo.InsertMessageBackfill(ctx, tx, CreateMessageInput{
+		ConversationID: conv.ID,
+		StudioID:       studioID,
+		Direction:      direction,
+		SourceKind:     sourceKind,
+		Body:           m.Text,
+		ExternalID:     m.MessageID,
+		SentAt:         sentAt,
+	})
+	if err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit: %w", err)
+	}
+	return stored != nil, nil
+}
+
+// HandleWAWebContactName records a display name for a WhatsApp contact that
+// wa-web's history sync knows about but has no message history to attach it
+// to (e.g. a saved phone contact with no chat yet, or a chat whose only
+// messages were media/stickers that handleWAWebBackfillOne's text-only
+// import skips). Without this, such contacts would show up in the inbox
+// contact list — or never show up at all — with nothing but a raw phone
+// number, even though WhatsApp already told us their real name during sync.
+//
+// Deliberately does not create a conversation or a lead — same
+// no-phantom-leads contract as HandleInboundWAWebBackfill — it only ever
+// upserts the contact_identities row (and fixes up an already-existing
+// lead's placeholder name, exactly like the backfill path does).
+func (s *Service) HandleWAWebContactName(ctx context.Context, studioID uuid.UUID, jid, displayName string) error {
+	displayName = strings.TrimSpace(displayName)
+	if jid == "" || displayName == "" {
+		return nil
+	}
+
+	tx, err := s.repo.Pool().BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	numericPart := jid
+	if idx := strings.Index(jid, "@"); idx > 0 {
+		numericPart = jid[:idx]
+	}
+	identityKey := jid
+	if strings.HasSuffix(jid, "@c.us") {
+		var lidValue string
+		_ = tx.QueryRow(ctx, `
+			SELECT value FROM contact_identities
+			WHERE studio_id = $1 AND kind = 'phone' AND value LIKE $2
+			LIMIT 1
+		`, studioID, numericPart+"%@lid").Scan(&lidValue)
+		if lidValue != "" {
+			identityKey = lidValue
+		}
+	}
+
+	identity, err := s.repo.FindOrCreateIdentity(ctx, tx, studioID, IdentityPhone, identityKey, displayName)
+	if err != nil {
+		return err
+	}
+	if identity.LeadID != nil {
+		if err := s.repo.UpdateLeadNameIfPlaceholder(ctx, tx, *identity.LeadID, displayName); err != nil {
+			return fmt.Errorf("sync wa-web contact-name lead name: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
 	}
 	return nil
 }
@@ -599,7 +1820,7 @@ func (s *Service) EnqueueReply(ctx context.Context, in SendInput) (int64, error)
 	if conv.Status == ConvClosed {
 		return 0, errors.New("conversation is closed")
 	}
-	return s.repo.EnqueueOutbound(ctx, OutboundJob{
+	id, err := s.repo.EnqueueOutbound(ctx, OutboundJob{
 		StudioID:       in.StudioID,
 		ConversationID: in.ConversationID,
 		Body:           in.Body,
@@ -608,6 +1829,17 @@ func (s *Service) EnqueueReply(ctx context.Context, in SendInput) (int64, error)
 		SourceUserID:   &in.UserID,
 		ScheduledFor:   time.Now().UTC(),
 	})
+	if err != nil {
+		return 0, err
+	}
+
+	s.bus.Publish(ctx, Event{
+		Kind:           EvtOutboundJobEnqueued,
+		StudioID:       in.StudioID,
+		ConversationID: in.ConversationID,
+	})
+
+	return id, nil
 }
 
 // ============================================================
@@ -628,6 +1860,18 @@ func (s *Service) ListMessages(ctx context.Context, studioID, conversationID uui
 
 func (s *Service) MarkRead(ctx context.Context, studioID, conversationID uuid.UUID) error {
 	if err := s.repo.MarkConversationRead(ctx, studioID, conversationID); err != nil {
+		return err
+	}
+	s.bus.Publish(ctx, Event{
+		Kind:           EvtConversationUpdated,
+		StudioID:       studioID,
+		ConversationID: conversationID,
+	})
+	return nil
+}
+
+func (s *Service) CloseConversation(ctx context.Context, studioID, conversationID uuid.UUID) error {
+	if err := s.repo.CloseConversation(ctx, studioID, conversationID); err != nil {
 		return err
 	}
 	s.bus.Publish(ctx, Event{
@@ -797,4 +2041,759 @@ func (s *Service) UpdateJob(ctx context.Context, studioID uuid.UUID, id int64, b
 		return errors.New("message body or attachment is required")
 	}
 	return s.repo.UpdateJob(ctx, studioID, id, body, scheduledFor, attachments)
+}
+
+func format12Hour(tm string) string {
+	tm = strings.TrimSpace(tm)
+	parsed, err := time.Parse("15:04", tm)
+	if err != nil {
+		if parsed12, err12 := time.Parse("03:04 PM", tm); err12 == nil {
+			return parsed12.Format("03:04 PM")
+		}
+		if parsed12NoZero, err12NoZero := time.Parse("3:04 PM", tm); err12NoZero == nil {
+			return parsed12NoZero.Format("03:04 PM")
+		}
+		return tm
+	}
+	return parsed.Format("03:04 PM")
+}
+
+func cleanPhoneNumber(in string) string {
+	var sb strings.Builder
+	for _, r := range in {
+		if r >= '0' && r <= '9' {
+			sb.WriteRune(r)
+		}
+	}
+	s := sb.String()
+	if len(s) == 10 {
+		s = "91" + s
+	}
+	return s
+}
+
+// matchPlanIndex finds which plan a free-text reply refers to: an exact
+// numbered choice ("2"), or the plan's name appearing in the message. Returns
+// -1 if nothing matches clearly enough to act on.
+func matchPlanIndex(text string, plans []Plan) int {
+	selectedIndex := -1
+	var matchedPlanLength int
+	lowerText := strings.ToLower(text)
+	for idx := range plans {
+		choiceStr := fmt.Sprintf("%d", idx+1)
+		cleanPlanName := strings.TrimSpace(strings.ReplaceAll(strings.ToLower(plans[idx].PlanName), "plan", ""))
+
+		if text == choiceStr || strings.Contains(text, "choice_"+choiceStr) {
+			return idx
+		}
+
+		if strings.Contains(lowerText, strings.ToLower(plans[idx].PlanName)) || (cleanPlanName != "" && strings.Contains(lowerText, cleanPlanName)) {
+			if len(plans[idx].PlanName) > matchedPlanLength {
+				selectedIndex = idx
+				matchedPlanLength = len(plans[idx].PlanName)
+			}
+		}
+	}
+	return selectedIndex
+}
+
+// formatPlanReprompt lists the available plans under a lead-in line, used
+// when a reply couldn't be matched to a specific plan.
+func formatPlanReprompt(intro string, plans []Plan) string {
+	var sb strings.Builder
+	sb.WriteString(intro + "\n")
+	for idx, p := range plans {
+		sb.WriteString(fmt.Sprintf("%d. %s (S$ %.2f/%s)\n", idx+1, p.PlanName, float64(p.PriceSGD)/100.0, p.BillingCycle))
+	}
+	return sb.String()
+}
+
+// buildPlanCheckoutBody creates a Stripe subscription checkout for the
+// selected plan and returns the confirmation message to send. When
+// oldSubscriptionID is non-empty (an existing member changing plans, not a
+// new signup), it's tagged in the session metadata so the webhook cancels
+// that subscription once the new one is confirmed — otherwise the customer
+// would end up billed on both the old and new plan.
+func (s *Service) buildPlanCheckoutBody(ctx context.Context, tx pgx.Tx, studioID, leadID uuid.UUID, selectedPlan Plan, oldSubscriptionID string) string {
+	secretKey, _, studioName, studioSlug, errStripe := s.repo.GetStripeConfig(ctx, studioID)
+	if errStripe != nil || secretKey == "" {
+		return "Thank you! Our team will reach out to you shortly."
+	}
+
+	var leadPhone, leadNameStr string
+	_ = tx.QueryRow(ctx, "SELECT phone, name FROM leads WHERE id = $1", leadID).Scan(&leadPhone, &leadNameStr)
+
+	frontendURL := os.Getenv("FRONTEND_URL")
+	if frontendURL == "" {
+		frontendURL = "http://localhost:3000"
+	}
+
+	sc := &client.API{}
+	sc.Init(secretKey, nil)
+	params := &stripe.CheckoutSessionParams{
+		PaymentMethodTypes: stripe.StringSlice([]string{"card"}),
+		Mode:               stripe.String("subscription"),
+		LineItems: []*stripe.CheckoutSessionLineItemParams{
+			{
+				PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
+					Currency:   stripe.String("sgd"),
+					UnitAmount: stripe.Int64(int64(selectedPlan.PriceSGD)),
+					Recurring: &stripe.CheckoutSessionLineItemPriceDataRecurringParams{
+						Interval: stripe.String("month"),
+					},
+					ProductData: &stripe.CheckoutSessionLineItemPriceDataProductDataParams{
+						Name: stripe.String(fmt.Sprintf("%s - %s Plan", studioName, selectedPlan.PlanName)),
+					},
+				},
+				Quantity: stripe.Int64(1),
+			},
+		},
+		SuccessURL: stripe.String(fmt.Sprintf("%s/payment-success?studio=%s&session_id={CHECKOUT_SESSION_ID}", frontendURL, studioSlug)),
+		CancelURL:  stripe.String(fmt.Sprintf("%s/payment-cancelled?studio=%s", frontendURL, studioSlug)),
+	}
+	if leadPhone != "" {
+		metadata := map[string]string{
+			"customer_phone": leadPhone,
+			"customer_name":  leadNameStr,
+			"studio_id":      studioID.String(),
+			"plan_id":        selectedPlan.ID.String(),
+		}
+		if oldSubscriptionID != "" {
+			metadata["old_subscription_id"] = oldSubscriptionID
+		}
+		params.Metadata = metadata
+	}
+
+	session, errSess := sc.CheckoutSessions.New(params)
+	if errSess == nil && session != nil && session.URL != "" {
+		verb := "complete your membership"
+		if oldSubscriptionID != "" {
+			verb = "confirm your plan change"
+		}
+		return fmt.Sprintf("Great choice! You selected the %s Plan. To %s, please subscribe here:\n%s", selectedPlan.PlanName, verb, session.URL)
+	}
+	return "Thank you! Our team will reach out to you shortly to finalize your membership."
+}
+
+func (s *Service) processInboundLeadAutomation(ctx context.Context, tx pgx.Tx, studioID uuid.UUID, conv *Conversation, stored *Message, body string) error {
+	if conv.LeadID == nil || stored == nil {
+		return nil
+	}
+	var leadName, leadStatus, leadNotes, autoContactStage, studioSlug, campaignSlug string
+	var slotsJSON []byte
+	var timezone string
+	err := tx.QueryRow(ctx, `
+		SELECT l.name, l.status, l.notes, l.auto_contact_stage, s.slug, COALESCE(c.slug, ''), s.availability_slots, s.availability_timezone
+		FROM leads l
+		JOIN studios s ON s.id = l.studio_id
+		LEFT JOIN campaigns c ON c.id = l.campaign_id
+		WHERE l.studio_id = $1 AND l.id = $2
+	`, studioID, *conv.LeadID).Scan(&leadName, &leadStatus, &leadNotes, &autoContactStage, &studioSlug, &campaignSlug, &slotsJSON, &timezone)
+
+	if err != nil {
+		slog.Warn("auto-contact: lead query failed, skipping", "err", err, "lead_id", conv.LeadID)
+		return nil // Lead not found or other db error, skip automation
+	}
+
+	slog.Info("auto-contact: processing inbound", "lead_id", conv.LeadID, "stage", autoContactStage, "status", leadStatus, "body", body)
+
+	text := strings.ToLower(strings.TrimSpace(body))
+	targetStage := autoContactStage
+	targetStatus := leadStatus
+	targetNotes := leadNotes
+	var outboundBody string
+	// Set true only by branches that enqueue their own outbound message
+	// directly (e.g. SendTrialPaymentLink) — keeps has_reply logging honest
+	// without letting the generic "if outboundBody != ''" send below fire a
+	// second, duplicate message for the same reply.
+	alreadySent := false
+
+	// Derive first name for personalised messages
+	firstName := leadName
+	if idx := strings.Index(firstName, " "); idx >= 0 {
+		firstName = firstName[:idx]
+	}
+	if firstName == "" {
+		firstName = "there"
+	}
+
+	// Parse availability timezone and slots
+	loc, errLoc := time.LoadLocation(timezone)
+	if errLoc != nil {
+		loc = time.UTC
+	}
+	now := time.Now().In(loc)
+
+	type availabilitySlot struct {
+		Day   string   `json:"day"`
+		Times []string `json:"times"`
+	}
+	var slots []availabilitySlot
+	if len(slotsJSON) > 0 {
+		_ = json.Unmarshal(slotsJSON, &slots)
+	}
+	slotsMap := make(map[string][]string)
+	for _, s := range slots {
+		if len(s.Times) > 0 {
+			slotsMap[strings.ToLower(s.Day)] = s.Times
+		}
+	}
+
+	getAvailableDays := func() ([]string, []string) {
+		var days []string
+		var daysWeekdayStr []string
+
+		// Only show dates if availability is configured
+		if len(slotsMap) == 0 {
+			return days, daysWeekdayStr // Return empty if no availability configured
+		}
+
+		t := now
+		for i := 0; i < 30 && len(days) < 3; i++ {
+			weekdayStr := strings.ToLower(t.Weekday().String())
+			if _, hasSlots := slotsMap[weekdayStr]; hasSlots {
+				days = append(days, t.Format("Mon, Jan 02"))
+				daysWeekdayStr = append(daysWeekdayStr, weekdayStr)
+			}
+			t = t.Add(24 * time.Hour)
+		}
+		return days, daysWeekdayStr
+	}
+
+	isInterested := text == "1" || text == "interested" || (strings.Contains(text, "interested") && !strings.Contains(text, "not interested")) ||
+		strings.Contains(text, "book a trial") || strings.Contains(text, "book trial") ||
+		strings.Contains(text, "want to book") || strings.Contains(text, "want to join") ||
+		strings.Contains(text, "want to try") || strings.Contains(text, "i want trial") ||
+		strings.Contains(text, "book a trail") || strings.Contains(text, "book trail")
+	isNotInterested := text == "2" || text == "not interested" || strings.Contains(text, "not interested") || strings.Contains(text, "not_interested")
+	// Only treat as a bot choice if the message is a short clear selection (≤8 words),
+	// not a question. Long messages containing "trial" or "member" are questions for AI.
+	isQuestion := strings.Contains(text, "?") || strings.HasPrefix(text, "what") ||
+		strings.HasPrefix(text, "how") || strings.HasPrefix(text, "when") ||
+		strings.HasPrefix(text, "where") || strings.HasPrefix(text, "why") ||
+		strings.HasPrefix(text, "is ") || strings.HasPrefix(text, "are ") ||
+		strings.HasPrefix(text, "do ") || strings.HasPrefix(text, "can ")
+	wordCount := len(strings.Fields(text))
+	isShortChoice := !isQuestion && wordCount <= 8
+
+	isTrial := text == "1" ||
+		(!isQuestion && (strings.Contains(text, "book a trial") || strings.Contains(text, "book trial") ||
+			strings.Contains(text, "want to book") || strings.Contains(text, "want to try") ||
+			strings.Contains(text, "book a trail") || strings.Contains(text, "book trail") ||
+			strings.Contains(text, "want trial") || strings.Contains(text, "i want trial") ||
+			(isShortChoice && (strings.Contains(text, "trial") || strings.Contains(text, "trail")))))
+	isMember := text == "2" ||
+		(isShortChoice && (strings.Contains(text, "become a member") || strings.Contains(text, "become member") ||
+			strings.Contains(text, "member")))
+
+	if autoContactStage == "awaiting_interest" {
+		if isInterested && !isNotInterested {
+			targetStage = "awaiting_options"
+			targetStatus = "contacted"
+			outboundBody = fmt.Sprintf("Hi %s! Great to hear from you. Please select an option:\n1. Book a Trial\n2. Become a Member", firstName)
+		} else if isNotInterested {
+			targetStage = "awaiting_reason"
+			targetStatus = "dropped"
+			outboundBody = "We would like to know why are u not interested."
+		}
+	} else if autoContactStage == "awaiting_options" {
+		if isTrial && !isMember {
+			targetStage = "completed"
+			targetStatus = "trial_booked"
+			// SendTrialPaymentLink enqueues the outbound itself — capture the
+			// body only for the has_reply log below, not for re-sending.
+			sentBody, _ := s.SendTrialPaymentLink(ctx, studioID, conv.ID, conv.LeadID, firstName)
+			alreadySent = sentBody != ""
+		} else if isMember && !isTrial {
+			plans, errPlans := s.repo.ListActivePlans(ctx, studioID)
+			if errPlans != nil || len(plans) == 0 {
+				targetStage = "completed"
+				outboundBody = "Our team will reach out to you ASAP to discuss membership options."
+			} else {
+				targetStage = "awaiting_plan_selection"
+				var sb strings.Builder
+				sb.WriteString("Awesome! Please select a membership plan:\n")
+				for idx, p := range plans {
+					sb.WriteString(fmt.Sprintf("%d. %s (S$ %.2f/%s)\n", idx+1, p.PlanName, float64(p.PriceSGD)/100.0, p.BillingCycle))
+					if len(p.Features) > 0 {
+						sb.WriteString(fmt.Sprintf("*- %s:* %s\n", p.PlanName, strings.Join(p.Features, ", ")))
+					}
+				}
+				outboundBody = sb.String()
+			}
+		}
+		// Unrecognised message at awaiting_options — let the AI worker answer the question.
+		// The AI prompt already appends "1. Book a Trial / 2. Become a Member" for new/contacted leads.
+	} else if autoContactStage == "awaiting_plan_selection" {
+		plans, errPlans := s.repo.ListActivePlans(ctx, studioID)
+		if errPlans == nil && len(plans) > 0 {
+			selectedIndex := matchPlanIndex(text, plans)
+			if selectedIndex == -1 {
+				// Unparseable reply (e.g. a question, or something unrelated) — do
+				// NOT default to a plan and fire off a real checkout link for a
+				// purchase the customer never asked for. Re-prompt and stay in this
+				// stage instead; for a genuine question, leave outboundBody empty
+				// (matching the convention used elsewhere in this function) so the
+				// AI worker answers it instead of automation.
+				if !isQuestion {
+					outboundBody = formatPlanReprompt("Sorry, I didn't catch that. Please reply with the number of the plan you'd like:", plans)
+				}
+			} else {
+				targetStage = "completed"
+				outboundBody = s.buildPlanCheckoutBody(ctx, tx, studioID, *conv.LeadID, plans[selectedIndex], "")
+			}
+		} else {
+			targetStage = "completed"
+			outboundBody = "Thank you! Our team will reach out to you shortly to finalize your membership."
+		}
+	} else if autoContactStage == "awaiting_plan_change_selection" {
+		// Existing member confirmed they want to change/upgrade their plan
+		// (triggered from the AI worker's yes-to-upgrade shortcut). Reuses the
+		// same safe plan-matching as a new signup, but tags the checkout with
+		// the member's current subscription so the webhook cancels it once the
+		// new one is confirmed — otherwise they'd end up billed on both.
+		plans, errPlans := s.repo.ListActivePlans(ctx, studioID)
+		if errPlans == nil && len(plans) > 0 {
+			selectedIndex := matchPlanIndex(text, plans)
+			if selectedIndex == -1 {
+				if !isQuestion {
+					outboundBody = formatPlanReprompt("Sorry, I didn't catch that. Please reply with the number of the plan you'd like to switch to:", plans)
+				}
+			} else {
+				var oldSubID string
+				_ = tx.QueryRow(ctx, "SELECT stripe_subscription_id FROM leads WHERE id = $1", *conv.LeadID).Scan(&oldSubID)
+				targetStage = "completed"
+				outboundBody = s.buildPlanCheckoutBody(ctx, tx, studioID, *conv.LeadID, plans[selectedIndex], oldSubID)
+			}
+		} else {
+			targetStage = "completed"
+			outboundBody = "Thank you! Our team will reach out to you shortly to update your plan."
+		}
+	} else if autoContactStage == "awaiting_trial_date" {
+		days, daysWeekdayStr := getAvailableDays()
+		if len(days) == 0 {
+			// Availability was removed after stage was set — reset to completed gracefully.
+			targetStage = "completed"
+			outboundBody = "Great! Our team will reach out to you within 24 hours to schedule your trial."
+		} else {
+			selectedDate := ""
+			selectedWeekday := ""
+			dayOf := func(i int, s []string) string {
+				if i < len(s) {
+					return strings.ToLower(s[i])
+				}
+				return ""
+			}
+			isOption1 := text == "1" || strings.Contains(text, "choice_1") || (dayOf(0, days) != "" && strings.Contains(text, dayOf(0, days)))
+			isOption2 := text == "2" || strings.Contains(text, "choice_2") || (dayOf(1, days) != "" && strings.Contains(text, dayOf(1, days)))
+			isOption3 := text == "3" || strings.Contains(text, "choice_3") || (dayOf(2, days) != "" && strings.Contains(text, dayOf(2, days)))
+
+			if isOption1 {
+				selectedDate = days[0]
+				selectedWeekday = daysWeekdayStr[0]
+			} else if isOption2 && len(days) > 1 {
+				selectedDate = days[1]
+				selectedWeekday = daysWeekdayStr[1]
+			} else if isOption3 && len(days) > 2 {
+				selectedDate = days[2]
+				selectedWeekday = daysWeekdayStr[2]
+			} else {
+				selectedDate = days[0]
+				selectedWeekday = daysWeekdayStr[0]
+			}
+
+			targetNotes = strings.TrimSpace(targetNotes + "\n[Selected Trial Date]: " + selectedDate)
+			targetStage = "awaiting_trial_time"
+
+			var timeSlots []string
+			if len(slotsMap) > 0 {
+				if times, ok := slotsMap[selectedWeekday]; ok && len(times) > 0 {
+					for _, tm := range times {
+						timeSlots = append(timeSlots, format12Hour(tm))
+					}
+				}
+			}
+			if len(timeSlots) == 0 {
+				timeSlots = []string{"09:00 AM", "12:00 PM", "04:00 PM"}
+			}
+
+			var sb strings.Builder
+			sb.WriteString("Please select a time slot:")
+			for idx, ts := range timeSlots {
+				sb.WriteString(fmt.Sprintf("\n%d. %s", idx+1, ts))
+			}
+			outboundBody = sb.String()
+		} // end else (days available)
+	} else if autoContactStage == "awaiting_trial_time" {
+		dateStr := ""
+		idx := strings.Index(targetNotes, "[Selected Trial Date]: ")
+		if idx != -1 {
+			dateStr = targetNotes[idx+len("[Selected Trial Date]: "):]
+			if end := strings.Index(dateStr, "\n"); end != -1 {
+				dateStr = dateStr[:end]
+			}
+			dateStr = strings.TrimSpace(dateStr)
+		}
+		if dateStr == "" {
+			dateStr = now.Format("Mon, Jan 02")
+		}
+
+		// Determine weekday from dateStr in local timezone
+		dateStrWithYear := fmt.Sprintf("%s %d", dateStr, now.Year())
+		parsedDate, errDate := time.ParseInLocation("Mon, Jan 02 2006", dateStrWithYear, loc)
+		selectedWeekday := ""
+		if errDate == nil {
+			selectedWeekday = strings.ToLower(parsedDate.Weekday().String())
+		} else {
+			selectedWeekday = strings.ToLower(now.Weekday().String())
+		}
+
+		var timeSlots []string
+		if len(slotsMap) > 0 {
+			if times, ok := slotsMap[selectedWeekday]; ok && len(times) > 0 {
+				for _, tm := range times {
+					timeSlots = append(timeSlots, format12Hour(tm))
+				}
+			}
+		}
+		if len(timeSlots) == 0 {
+			timeSlots = []string{"09:00 AM", "12:00 PM", "04:00 PM"}
+		}
+
+		selectedIndex := -1
+		for idx := range timeSlots {
+			choiceStr := fmt.Sprintf("%d", idx+1)
+			if text == choiceStr || strings.Contains(text, "choice_"+choiceStr) {
+				selectedIndex = idx
+				break
+			}
+		}
+		if selectedIndex == -1 {
+			for idx, ts := range timeSlots {
+				cleanText := strings.ReplaceAll(strings.ReplaceAll(text, " ", ""), ":", "")
+				cleanTs := strings.ReplaceAll(strings.ReplaceAll(strings.ToLower(ts), " ", ""), ":", "")
+				if strings.Contains(cleanText, cleanTs) {
+					selectedIndex = idx
+					break
+				}
+			}
+		}
+		if selectedIndex == -1 || selectedIndex >= len(timeSlots) {
+			selectedIndex = 0
+		}
+		selectedTime := timeSlots[selectedIndex]
+
+		targetNotes = strings.ReplaceAll(targetNotes, "[Selected Trial Date]: "+dateStr, "")
+		targetNotes = strings.TrimSpace(targetNotes + "\n[Selected Trial Slot]: " + dateStr + " " + selectedTime)
+		targetStage = "completed"
+		targetStatus = "trial_booked"
+
+		secretKey, _, studioName, studioSlug, errStripe := s.repo.GetStripeConfig(ctx, studioID)
+		if errStripe == nil && secretKey != "" {
+			var leadPhone, leadNameStr string
+			var trialPrice int64
+			_ = tx.QueryRow(ctx, "SELECT phone, name FROM leads WHERE id = $1", *conv.LeadID).Scan(&leadPhone, &leadNameStr)
+
+			// Get Trial plan price from the studio's plans
+			_ = tx.QueryRow(ctx, `
+				SELECT COALESCE(price_sgd, 0) FROM plans
+				WHERE studio_id = $1 AND plan_name = 'Trial' AND is_active = true
+				LIMIT 1
+			`, studioID).Scan(&trialPrice)
+
+			amount := trialPrice
+			cur := "sgd"
+			if amount == 0 {
+				amount = 2500
+			}
+
+			frontendURL := os.Getenv("FRONTEND_URL")
+			if frontendURL == "" {
+				frontendURL = "http://localhost:3000"
+			}
+
+			sc := &client.API{}
+			sc.Init(secretKey, nil)
+			params := &stripe.CheckoutSessionParams{
+				PaymentMethodTypes: stripe.StringSlice([]string{"card"}),
+				LineItems: []*stripe.CheckoutSessionLineItemParams{
+					{
+						PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
+							Currency:   stripe.String(cur),
+							UnitAmount: stripe.Int64(int64(amount)),
+							ProductData: &stripe.CheckoutSessionLineItemPriceDataProductDataParams{
+								Name:        stripe.String(fmt.Sprintf("%s Trial Session", studioName)),
+								Description: stripe.String("Secure your trial workout session at " + studioName),
+							},
+						},
+						Quantity: stripe.Int64(1),
+					},
+				},
+				Mode: stripe.String("payment"),
+				InvoiceCreation: &stripe.CheckoutSessionInvoiceCreationParams{
+					Enabled: stripe.Bool(true),
+				},
+				SuccessURL: stripe.String(fmt.Sprintf("%s/payment-success?studio=%s&session_id={CHECKOUT_SESSION_ID}", frontendURL, studioSlug)),
+				CancelURL:  stripe.String(fmt.Sprintf("%s/payment-cancelled?studio=%s", frontendURL, studioSlug)),
+			}
+			if leadPhone != "" {
+				params.Metadata = map[string]string{
+					"customer_phone": leadPhone,
+					"customer_name":  leadNameStr,
+					"studio_id":      studioID.String(),
+				}
+			}
+			session, errSess := sc.CheckoutSessions.New(params)
+			if errSess == nil && session != nil && session.URL != "" {
+				outboundBody = fmt.Sprintf("Great! Your trial is booked for %s at %s. To secure your spot, please complete your payment here:\n%s", dateStr, selectedTime, session.URL)
+			} else {
+				outboundBody = "Thank you! Our team will reach out to you shortly."
+			}
+		} else {
+			outboundBody = "Thank you! Our team will reach out to you shortly."
+		}
+	} else if autoContactStage == "awaiting_reason" {
+		targetNotes = strings.TrimSpace(targetNotes + "\n[Dropped Reason]: " + body)
+		targetStage = "completed"
+		outboundBody = "Thank you for your time we would get back to u."
+	} else if autoContactStage == "completed" && leadStatus == "trial_booked" {
+		// Customer is responding to the 1-day trial followup.
+		// Any non-declining message → show membership plans and move to plan selection.
+		// A question ("what is my current plan?") is neither a decline nor an
+		// intent to buy — it must fall through to the AI, not get funneled into
+		// a purchase flow just because it happens to contain a broad word like
+		// "plan" or "pro" (matches "process", "problem", etc. too).
+		isDecline := text == "2" || text == "no" ||
+			strings.Contains(text, "not now") ||
+			strings.Contains(text, "maybe later") ||
+			strings.Contains(text, "not interested")
+		wantsMembership := !isDecline && !isQuestion && (text == "1" ||
+			strings.Contains(text, "yes") ||
+			strings.Contains(text, "ready") ||
+			strings.Contains(text, "sign") ||
+			strings.Contains(text, "become a member") ||
+			strings.Contains(text, "become member") ||
+			strings.Contains(text, "membership") ||
+			strings.Contains(text, "join") ||
+			strings.Contains(text, "premium") ||
+			strings.Contains(text, "package"))
+		if wantsMembership {
+			plans, errPlans := s.repo.ListActivePlans(ctx, studioID)
+			if errPlans != nil || len(plans) == 0 {
+				targetStage = "awaiting_plan_selection"
+				outboundBody = "Our team will reach out to you ASAP to discuss membership options."
+			} else {
+				targetStage = "awaiting_plan_selection"
+				var sb strings.Builder
+				sb.WriteString("Awesome! Please select a membership plan:\n")
+				for idx, p := range plans {
+					sb.WriteString(fmt.Sprintf("%d. %s (S$ %.2f/%s)\n", idx+1, p.PlanName, float64(p.PriceSGD)/100.0, p.BillingCycle))
+					if len(p.Features) > 0 {
+						sb.WriteString(fmt.Sprintf("*- %s:* %s\n", p.PlanName, strings.Join(p.Features, ", ")))
+					}
+				}
+				outboundBody = sb.String()
+			}
+		}
+	}
+
+	slog.Info("auto-contact: result", "lead_id", conv.LeadID, "old_stage", autoContactStage, "new_stage", targetStage, "has_reply", outboundBody != "" || alreadySent)
+
+	// Update the lead if anything changed
+	if targetStage != autoContactStage || targetStatus != leadStatus || targetNotes != leadNotes {
+		_, err = tx.Exec(ctx, `
+			UPDATE leads
+			SET status = $3, notes = $4, auto_contact_stage = $5, updated_at = now()
+			WHERE studio_id = $1 AND id = $2
+		`, studioID, *conv.LeadID, targetStatus, targetNotes, targetStage)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Send outbound reply whenever automation produced one (stage may or may not have changed).
+	// Skip if a branch above (e.g. SendTrialPaymentLink) already enqueued its
+	// own message directly — outboundBody is empty in that case, so this is
+	// belt-and-suspenders against a future branch making the same mistake.
+	if outboundBody != "" && !alreadySent {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO outbound_jobs (studio_id, conversation_id, body, attachments,
+			                           source_kind, source_ref, scheduled_for, next_attempt_at)
+			VALUES ($1, $2, $3, '[]'::jsonb, 'automation', $4, $5, $5)
+		`, studioID, conv.ID, outboundBody, fmt.Sprintf("lead:%s:auto_reply:%s", conv.LeadID.String(), targetStage), time.Now().UTC())
+		if err != nil {
+			return err
+		}
+	}
+
+	// If they just transitioned to trial_booked AND completed (trial actually confirmed),
+	// schedule the 1-day check-in follow-up.
+	if targetStatus == "trial_booked" && leadStatus != "trial_booked" && targetStage == "completed" {
+		followupBody := fmt.Sprintf("Hi %s! We hope you had a great trial session! 🎉 Are you ready to take the next step and become a member? Reply:\n1. Yes, sign me up!\n2. Maybe later", firstName)
+		_, err = tx.Exec(ctx, `
+			INSERT INTO outbound_jobs (studio_id, conversation_id, body, attachments,
+			                           source_kind, source_ref, scheduled_for, next_attempt_at)
+			VALUES ($1, $2, $3, '[]'::jsonb, 'automation', $4, $5, $5)
+		`, studioID, conv.ID, followupBody, fmt.Sprintf("lead:%s:trial_followup:1day", conv.LeadID.String()), time.Now().UTC().Add(24*time.Hour))
+		if err != nil {
+			return err
+		}
+	}
+
+	// Enqueue Google Sheets update if status or notes changed
+	if targetStatus != leadStatus || targetNotes != leadNotes {
+		var l leads.Lead
+		var ipText *string
+		row := tx.QueryRow(ctx, `
+			SELECT l.id, l.studio_id, l.campaign_id, l.name, COALESCE(l.first_name, ''), COALESCE(l.last_name, ''), l.email, l.phone, l.fitness_plan, l.goals,
+			       l.source, l.status, l.notes, l.contact_attempts, l.last_contacted_at, l.contact_made, l.hot_lead, l.trial_purchased, l.auto_contact_stage, l.referrer, l.user_agent, l.ip_address::text, l.created_at, l.updated_at,
+			       s.name, s.slug, c.name, c.slug
+			FROM leads l
+			JOIN campaigns c ON c.id = l.campaign_id
+			JOIN studios s ON s.id = l.studio_id
+			WHERE l.id = $1
+		`, *conv.LeadID)
+		scanErr := row.Scan(&l.ID, &l.StudioID, &l.CampaignID, &l.Name, &l.FirstName, &l.LastName, &l.Email, &l.Phone, &l.FitnessPlan, &l.Goals,
+			&l.Source, &l.Status, &l.Notes, &l.ContactAttempts, &l.LastContactedAt, &l.ContactMade, &l.HotLead, &l.TrialPurchased, &l.AutoContactStage, &l.Referrer, &l.UserAgent, &ipText, &l.CreatedAt, &l.UpdatedAt,
+			&l.StudioName, &l.StudioSlug, &l.CampaignName, &l.CampaignSlug)
+		if scanErr == nil {
+			payload, mErr := json.Marshal(l)
+			if mErr == nil {
+				_, _ = tx.Exec(ctx, `
+					INSERT INTO outbox (aggregate_type, aggregate_id, event_type, destination, payload)
+					VALUES ('lead', $1, 'lead.updated', 'google_sheets', $2)
+				`, l.ID, string(payload))
+			}
+		}
+	}
+	return nil
+}
+
+type ConnectXInput struct {
+	ConsumerKey       string `json:"consumer_key"`
+	ConsumerSecret    string `json:"consumer_secret"`
+	AccessToken       string `json:"access_token"`
+	AccessTokenSecret string `json:"access_token_secret"`
+	XHandle           string `json:"x_handle"`
+}
+
+func (s *Service) ConnectXChannel(ctx context.Context, studioID uuid.UUID, in ConnectXInput) (*ChannelAccount, error) {
+	in.ConsumerKey = strings.TrimSpace(in.ConsumerKey)
+	in.ConsumerSecret = strings.TrimSpace(in.ConsumerSecret)
+	in.AccessToken = strings.TrimSpace(in.AccessToken)
+	in.AccessTokenSecret = strings.TrimSpace(in.AccessTokenSecret)
+	in.XHandle = strings.TrimSpace(in.XHandle)
+
+	if in.ConsumerKey == "" || in.ConsumerSecret == "" || in.AccessToken == "" || in.AccessTokenSecret == "" || in.XHandle == "" {
+		return nil, errors.New("consumer key, consumer secret, access token, token secret, and x handle are required")
+	}
+
+	accessTokenJSON, err := json.Marshal(map[string]string{
+		"consumer_key":        in.ConsumerKey,
+		"consumer_secret":     in.ConsumerSecret,
+		"access_token":        in.AccessToken,
+		"access_token_secret": in.AccessTokenSecret,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return s.repo.CreateChannel(ctx, CreateChannelInput{
+		StudioID:      studioID,
+		Kind:          KindXDM,
+		BSP:           "x_dm",
+		ExternalID:    in.XHandle,
+		ParentID:      in.ConsumerKey,
+		DisplayHandle: in.XHandle,
+		AccessToken:   string(accessTokenJSON),
+	})
+}
+
+// SendTrialPaymentLink creates a Stripe one-time checkout for a trial session,
+// shortens it via trigger_links, enqueues the outbound message, and returns the
+// message body. Called by both the automation flow and the AI worker.
+func (s *Service) SendTrialPaymentLink(ctx context.Context, studioID, convID uuid.UUID, leadID *uuid.UUID, firstName string) (string, error) {
+	secretKey, trialAmountSGD, studioName, studioSlug, errStripe := s.repo.GetStripeConfig(ctx, studioID)
+	if errStripe != nil || secretKey == "" {
+		body := fmt.Sprintf("Hi %s! Great choice. Our team will reach out to you within 24 hours to schedule your trial. We look forward to seeing you!", firstName)
+		_, err := s.repo.EnqueueOutbound(ctx, OutboundJob{
+			StudioID: studioID, ConversationID: convID,
+			Body: body, SourceKind: SourceAI, SourceRef: "trial_link",
+			ScheduledFor: time.Now().UTC(),
+		})
+		return body, err
+	}
+
+	// Resolve amount: studio trial_amount_sgd → lowest active plan → 2500 fallback
+	amount := int64(trialAmountSGD)
+	if amount == 0 {
+		plans, _ := s.repo.ListActivePlans(ctx, studioID)
+		for _, p := range plans {
+			if amount == 0 || int64(p.PriceSGD) < amount {
+				amount = int64(p.PriceSGD)
+			}
+		}
+	}
+	if amount == 0 {
+		amount = 2500
+	}
+
+	var leadPhone, leadName string
+	if leadID != nil {
+		_ = s.repo.pool.QueryRow(ctx, "SELECT phone, name FROM leads WHERE id = $1", *leadID).Scan(&leadPhone, &leadName)
+	}
+
+	frontendURL := os.Getenv("FRONTEND_URL")
+	if frontendURL == "" {
+		frontendURL = "http://localhost:3000"
+	}
+
+	sc := &client.API{}
+	sc.Init(secretKey, nil)
+	params := &stripe.CheckoutSessionParams{
+		PaymentMethodTypes: stripe.StringSlice([]string{"card"}),
+		LineItems: []*stripe.CheckoutSessionLineItemParams{
+			{
+				PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
+					Currency:   stripe.String("sgd"),
+					UnitAmount: stripe.Int64(amount),
+					ProductData: &stripe.CheckoutSessionLineItemPriceDataProductDataParams{
+						Name:        stripe.String(fmt.Sprintf("%s Trial Session", studioName)),
+						Description: stripe.String("Secure your trial workout session at " + studioName),
+					},
+				},
+				Quantity: stripe.Int64(1),
+			},
+		},
+		Mode:       stripe.String("payment"),
+		SuccessURL: stripe.String(fmt.Sprintf("%s/payment-success?studio=%s&session_id={CHECKOUT_SESSION_ID}", frontendURL, studioSlug)),
+		CancelURL:  stripe.String(fmt.Sprintf("%s/payment-cancelled?studio=%s", frontendURL, studioSlug)),
+		Metadata: map[string]string{
+			"customer_phone": leadPhone,
+			"customer_name":  leadName,
+			"studio_id":      studioID.String(),
+		},
+	}
+
+	session, errSess := sc.CheckoutSessions.New(params)
+
+	var body string
+	if errSess == nil && session != nil && session.URL != "" {
+		tl := &TriggerLink{StudioID: studioID, Name: fmt.Sprintf("Trial - %s", leadName), URL: session.URL}
+		if errLink := s.repo.CreateTriggerLink(ctx, tl); errLink == nil {
+			shortURL := fmt.Sprintf("%s/api/v1/links/%s", frontendURL, tl.ID.String())
+			body = fmt.Sprintf("Hi %s! Great choice. Here's your secure trial booking link for %s:\n\n%s\n\nComplete your payment to confirm your spot. We look forward to seeing you!", firstName, studioName, shortURL)
+		} else {
+			body = fmt.Sprintf("Hi %s! Great choice. Here's your secure trial booking link for %s:\n\n%s\n\nWe look forward to seeing you!", firstName, studioName, session.URL)
+		}
+	} else {
+		body = fmt.Sprintf("Hi %s! Great choice. Our team will reach out to you within 24 hours to confirm your trial at %s. We look forward to seeing you!", firstName, studioName)
+	}
+
+	_, err := s.repo.EnqueueOutbound(ctx, OutboundJob{
+		StudioID: studioID, ConversationID: convID,
+		Body: body, SourceKind: SourceAI, SourceRef: "trial_link",
+		ScheduledFor: time.Now().UTC(),
+	})
+	return body, err
 }

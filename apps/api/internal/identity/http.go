@@ -1,11 +1,8 @@
 package identity
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"io"
-	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -29,11 +26,13 @@ type Handler struct {
 // the frontend to render branded chrome immediately after login. The `Active`
 // flag drives the inactive-studio lockout in the AppShell.
 type StudioBrand struct {
-	Slug       string `json:"slug"`
-	Name       string `json:"name"`
-	BrandColor string `json:"brandColor"`
-	LogoURL    string `json:"logoUrl"`
-	Active     bool   `json:"active"`
+	Slug                 string `json:"slug"`
+	Name                 string `json:"name"`
+	BrandColor           string `json:"brandColor"`
+	LogoURL              string `json:"logoUrl"`
+	Active               bool   `json:"active"`
+	SocialPlannerEnabled bool   `json:"socialPlannerEnabled"`
+	SubscriptionTier     string `json:"subscriptionTier"`
 }
 
 // StudioBrandLookup resolves a studio's brand info by id. Implemented in main
@@ -46,11 +45,16 @@ func NewHandler(repo *Repo, tokens *TokenIssuer, cookie config.CookieConfig, bra
 }
 
 func (h *Handler) Routes(r chi.Router) {
-	r.Post("/auth/login", h.login)
+	r.With(httpx.AuthRateLimiter).Post("/auth/login", h.login)
 	r.Post("/auth/logout", h.logout)
 	r.With(h.RequireAuth).Get("/auth/me", h.me)
-	r.With(h.RequireAuth).Post("/auth/password", h.changePassword)
+	r.With(h.RequireAuth, httpx.AuthRateLimiter).Post("/auth/password", h.changePassword)
 }
+
+func (h *Handler) StudioRoutes(r chi.Router) {
+	r.Get("/users", h.listStudioUsers)
+}
+
 
 type loginReq struct {
 	Email    string `json:"email"`
@@ -114,7 +118,7 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		Expires:  exp,
 		HttpOnly: true,
 		Secure:   h.cookie.Secure,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 	})
 	httpx.JSON(w, http.StatusOK, h.buildMeRes(r.Context(), u))
 }
@@ -129,7 +133,7 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   -1,
 		HttpOnly: true,
 		Secure:   h.cookie.Secure,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 	})
 	httpx.NoContent(w)
 }
@@ -141,7 +145,7 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusUnauthorized, "unauthorized", "session no longer valid")
 		return
 	}
-	
+
 	// If the user has a studio, ensure it actually exists/is accessible.
 	// If the database was reset but the JWT is still valid, this prevents
 	// the user from getting stuck in a 403 loop on all other pages.
@@ -158,7 +162,7 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 				MaxAge:   -1,
 				HttpOnly: true,
 				Secure:   h.cookie.Secure,
-				SameSite: http.SameSiteLaxMode,
+				SameSite: http.SameSiteStrictMode,
 			})
 			httpx.WriteError(w, http.StatusUnauthorized, "unauthorized", "studio no longer accessible")
 			return
@@ -257,21 +261,6 @@ func MustClaims(ctx context.Context) *Claims {
 // RequireAuth verifies the session cookie and injects claims into the context.
 func (h *Handler) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Read and log the incoming body so we can capture payloads even when
-		// the request is unauthenticated. Restore the body for downstream
-		// handlers.
-		if r.Body != nil {
-			if b, err := io.ReadAll(r.Body); err == nil {
-				logger.FromCtx(r.Context(), slog.Default()).Info("auth_incoming_body",
-					"method", r.Method,
-					"path", r.URL.Path,
-					"content_type", r.Header.Get("Content-Type"),
-					"body", string(b),
-				)
-				r.Body = io.NopCloser(bytes.NewReader(b))
-			}
-		}
-
 		cookie, err := r.Cookie(h.cookie.Name)
 		if err != nil || cookie.Value == "" {
 			httpx.WriteError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
@@ -312,3 +301,46 @@ func RequireRole(allowed ...Role) func(http.Handler) http.Handler {
 		})
 	}
 }
+
+func (h *Handler) listStudioUsers(w http.ResponseWriter, r *http.Request) {
+	studioIDStr := chi.URLParam(r, "studioId")
+	if studioIDStr == "" {
+		httpx.WriteError(w, http.StatusBadRequest, "bad_request", "studioId parameter required")
+		return
+	}
+	studioID, err := uuid.Parse(studioIDStr)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "bad_request", "invalid studioId format")
+		return
+	}
+
+	c := MustClaims(r.Context())
+	if !c.IsSuper() && (c.StudioID == nil || *c.StudioID != studioID) {
+		httpx.WriteError(w, http.StatusForbidden, "forbidden", "cannot access this studio")
+		return
+	}
+
+	users, err := h.repo.ListByStudioID(r.Context(), studioID)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "internal", "failed to list users")
+		return
+	}
+
+	type userRes struct {
+		ID    uuid.UUID `json:"id"`
+		Email string    `json:"email"`
+		Role  Role      `json:"role"`
+	}
+
+	res := make([]userRes, len(users))
+	for i, u := range users {
+		res[i] = userRes{
+			ID:    u.ID,
+			Email: u.Email,
+			Role:  u.Role,
+		}
+	}
+
+	httpx.JSON(w, http.StatusOK, map[string]any{"users": res})
+}
+

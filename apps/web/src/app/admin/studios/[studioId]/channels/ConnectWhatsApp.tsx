@@ -9,7 +9,7 @@ import { Input } from '@/components/ui/Input';
 import { FieldError, FieldHint, Label } from '@/components/ui/Label';
 import { ApiError, api } from '@/lib/api';
 
-export function ConnectWhatsApp({ studioId }: { studioId: string }) {
+export function ConnectWhatsApp({ studioId, showToast }: { studioId: string; showToast: (msg: string) => void }) {
   const router = useRouter();
   const [mounted, setMounted] = useState(false);
   const [wabaId, setWabaId] = useState('');
@@ -46,6 +46,7 @@ export function ConnectWhatsApp({ studioId }: { studioId: string }) {
       setPhoneNumberId('');
       setDisplayPhone('');
       setAccessToken('');
+      showToast('WhatsApp channel connected successfully.');
       router.refresh();
     } catch (err) {
       if (err instanceof ApiError) setError(getErrorMessage(err.message));
@@ -138,11 +139,6 @@ export function ConnectWhatsApp({ studioId }: { studioId: string }) {
         >
           Connect WhatsApp
         </Button>
-        <p className="text-xs text-center text-slate-500 dark:text-slate-400">
-          <a href="/docs/meta-whatsapp" className="text-blue-600 dark:text-blue-400 hover:underline">
-            Setup guide →
-          </a>
-        </p>
       </form>
     </Card>
   );

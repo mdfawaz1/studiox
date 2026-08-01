@@ -1,8 +1,8 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
-import { useState, type CSSProperties } from 'react';
-import { ArrowRight, Building2, Eye, EyeOff, Inbox, Sparkles } from 'lucide-react';
+import { useState, useEffect, type CSSProperties } from 'react';
+import { ArrowRight, Building2, Eye, EyeOff, Inbox, Sparkles, Sun, Moon } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
 import { Input } from '@/components/ui/Input';
@@ -21,6 +21,24 @@ export default function LoginPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [theme, setTheme] = useState<'light' | 'dark'>('light');
+
+  useEffect(() => {
+    const isDark = document.documentElement.classList.contains('dark');
+    setTheme(isDark ? 'dark' : 'light');
+  }, []);
+
+  const toggleTheme = () => {
+    const next = theme === 'light' ? 'dark' : 'light';
+    setTheme(next);
+    if (next === 'dark') {
+      document.documentElement.classList.add('dark');
+      localStorage.setItem('theme', 'dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+      localStorage.setItem('theme', 'light');
+    }
+  };
   const [postBrand, setPostBrand] = useState<string | null>(null);
 
   async function onSubmit(e: React.FormEvent) {
@@ -61,12 +79,18 @@ export default function LoginPage() {
 
   return (
     <main
-      className="min-h-screen w-full text-zinc-900 transition-all duration-700 dark:text-zinc-100"
-      style={{
-        ...themeStyle,
-        background: 'rgb(248, 250, 255)',
-      }}
+      className="min-h-screen w-full text-zinc-900 transition-all duration-700 dark:text-zinc-100 bg-slate-50 dark:bg-neutral-950"
+      style={themeStyle}
     >
+      {/* Theme Toggle Button */}
+      <button
+        onClick={toggleTheme}
+        className="fixed right-5 top-5 z-50 grid h-10 w-10 place-items-center rounded-xl border border-white/20 bg-white/60 dark:bg-zinc-800/60 dark:border-white/10 text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white backdrop-blur-md shadow-sm transition-all duration-300"
+        aria-label="Toggle theme"
+        title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
+      >
+        {theme === 'light' ? <Moon className="h-[18px] w-[18px]" /> : <Sun className="h-[18px] w-[18px]" />}
+      </button>
       <div className="grid min-h-screen w-full grid-cols-1 lg:grid-cols-[1.1fr,1fr] xl:grid-cols-[1.2fr,1fr]">
         {/* Hero */}
         <section className="relative hidden overflow-hidden bg-neutral-950 text-white lg:flex lg:flex-col lg:justify-between lg:px-12 lg:py-12 xl:px-16">
@@ -78,6 +102,7 @@ export default function LoginPage() {
               backgroundImage: 'linear-gradient(to right, rgba(10, 10, 11, 0.2) 0%, rgba(10, 10, 11, 0.8) 100%), url("/platform-bg.png")',
               backgroundSize: 'cover',
               backgroundPosition: 'center',
+              backgroundRepeat: 'no-repeat',
             }}
           />
           <div
@@ -94,13 +119,12 @@ export default function LoginPage() {
           <div className="pointer-events-none absolute inset-0 overflow-hidden">
             <div className="absolute -left-[10%] top-[20%] h-[40%] w-[40%] rounded-full bg-brand-500/15 blur-[120px] animate-pulse-liquid" />
             <div className="absolute -right-[10%] top-[50%] h-[40%] w-[40%] rounded-full bg-sky-500/10 blur-[120px] animate-pulse-liquid" style={{ animationDelay: '3s' }} />
+            <div className="absolute left-[20%] top-[75%] h-[35%] w-[35%] rounded-full bg-pink-500/12 blur-[100px] animate-pulse-liquid" style={{ animationDelay: '6s' }} />
           </div>
 
           <div className="relative">
             <div className="flex animate-in items-center gap-4" style={{ animationDelay: '100ms' }}>
-              <div className="grid h-14 w-14 place-items-center rounded-3xl bg-gradient-to-br from-brand-400 via-brand-primary to-brand-700 text-lg font-black text-white shadow-2xl shadow-brand-500/40 ring-2 ring-white/10">
-                1H
-              </div>
+              <img src="/logo.png" alt="1herosocial.ai Logo" className="h-14 w-14 object-contain rounded-3xl shadow-2xl shadow-brand-500/40 ring-2 ring-white/10" />
               <div className="text-2xl font-black tracking-tight text-white">1herosocial.ai</div>
             </div>
 
@@ -122,22 +146,18 @@ export default function LoginPage() {
 
         {/* Form - Right Side with Rich Professional Gradient */}
         <section 
-          className="relative flex items-center justify-center px-6 py-12 sm:px-10 lg:px-12 xl:px-16"
-          style={{
-            background: 'linear-gradient(135deg, #f3f0ff 0%, #e0e7ff 50%, #dbeafe 100%)',
-          }}
+          className="relative flex items-center justify-center px-6 py-12 sm:px-10 lg:px-12 xl:px-16 bg-gradient-to-br from-violet-50 via-indigo-50 to-blue-50 dark:from-neutral-950 dark:via-zinc-900/50 dark:to-neutral-950"
         >
           {/* Enhanced Ambient Glows for Right Side */}
           <div className="absolute inset-0 -z-10 overflow-hidden">
             <div className="absolute left-[-20%] top-[-10%] h-[80%] w-[80%] rounded-full bg-violet-400/20 blur-[120px] animate-pulse-liquid" />
             <div className="absolute bottom-[-20%] right-[-10%] h-[80%] w-[80%] rounded-full bg-sky-400/20 blur-[120px] animate-pulse-liquid" style={{ animationDelay: '2s' }} />
+            <div className="absolute right-[15%] top-[30%] h-[60%] w-[60%] rounded-full bg-pink-400/12 blur-[130px] animate-pulse-liquid" style={{ animationDelay: '4.5s' }} />
           </div>
 
           <div className="w-full max-w-md animate-in" style={{ animationDelay: '500ms' }}>
             <div className="mb-12 flex items-center gap-4 lg:hidden">
-              <div className="grid h-14 w-14 place-items-center rounded-3xl bg-gradient-to-br from-brand-400 via-brand-primary to-brand-700 text-lg font-black text-white shadow-xl ring-2 ring-white/10">
-                1H
-              </div>
+              <img src="/logo.png" alt="1herosocial.ai Logo" className="h-14 w-14 object-contain rounded-3xl shadow-xl ring-2 ring-white/10" />
               <div className="text-2xl font-black tracking-tight text-zinc-900 dark:text-white">1herosocial.ai</div>
             </div>
 
