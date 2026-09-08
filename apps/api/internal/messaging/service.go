@@ -544,7 +544,7 @@ func (s *Service) HandleInboundWhatsAppMessage(ctx context.Context,
 	}
 
 	// Deterministically update lead status based on button clicks / option selections.
-	// This runs inside the transaction and works even if the AI (Claude) worker is disabled.
+	// No-ops if ai_enabled is off for this conversation (see the guard inside).
 	if err := s.processInboundLeadAutomation(ctx, tx, channel.StudioID, conv, stored, body); err != nil {
 		return fmt.Errorf("inbound lead automation: %w", err)
 	}
@@ -2191,6 +2191,14 @@ func (s *Service) buildPlanCheckoutBody(ctx context.Context, tx pgx.Tx, studioID
 
 func (s *Service) processInboundLeadAutomation(ctx context.Context, tx pgx.Tx, studioID uuid.UUID, conv *Conversation, stored *Message, body string) error {
 	if conv.LeadID == nil || stored == nil {
+		return nil
+	}
+	// AI reply off means off — including this deterministic 1/2 stage machine
+	// and the trial/booking payment link it sends. Previously this ran
+	// regardless of ai_enabled (see the AI worker's own equivalent gate at
+	// the top of processMessage), which meant a studio that turned AI off
+	// for a conversation would still see an automatic booking link go out.
+	if !conv.AIEnabled {
 		return nil
 	}
 	var leadName, leadStatus, leadNotes, autoContactStage, studioSlug, campaignSlug string
